@@ -7,3 +7,5 @@ description = "Windows liquid glass rendering experiment (Skia + SkSL)"
 
 [dependencies]
 skia-safe = { version = "0.156.0", features = ["d3d"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
+winit = "0.30.13"
