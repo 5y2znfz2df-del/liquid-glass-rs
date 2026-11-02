@@ -12,6 +12,9 @@
 //
 // 许可证：GPLv3（见 LICENSE）。着色器为原创实现，未复制他人代码。
 
+// 不弹控制台窗口（否则会盖在玻璃上面）
+#![windows_subsystem = "windows"]
+
 use skia_safe::{
     surfaces, Color, Data, EncodedImageFormat, Paint, PaintStyle, Rect, RRect, RuntimeEffect,
     SamplingOptions, Surface, TileMode,
@@ -22,13 +25,14 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP,
-    HDC, HGDIOBJ,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
+    GetDC, GetDIBits, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
+    BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA,
-    WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    GetWindowLongPtrW, GetWindowRect, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -120,44 +124,116 @@ half4 main(float2 coord) {
 }
 "#;
 
+// ------------------------------------------------------------ 抓屏 --
+/// 抓取屏幕上一个矩形区域，返回 BGRA 像素（alpha 强制 255）。
+///
+/// 因为窗口设了 WDA_EXCLUDEFROMCAPTURE，抓到的内容里**不含自己**，
+/// 所以拿到的就是"玻璃背后的桌面"。
+fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        if bmp.is_invalid() {
+            ReleaseDC(None, screen);
+            return None;
+        }
+        let old = SelectObject(mem, bmp.into());
+
+        let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY);
+
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h, // 自上而下
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0, // BI_RGB
+            ..Default::default()
+        };
+
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h as u32,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+
+        if ok.is_err() || lines == 0 {
+            return None;
+        }
+
+        // BitBlt 出来的 alpha 是 0，强制不透明
+        for i in (3..buf.len()).step_by(4) {
+            buf[i] = 255;
+        }
+        Some(buf)
+    }
+}
+
 // ------------------------------------------------------------ 渲染一帧 --
 /// 把一帧画进 surface。`t` 是秒，用来让背景动起来（证明是实时渲染）。
-fn draw_frame(surface: &mut Surface, effect: &RuntimeEffect, t: f32) {
-    // ---- 背景（模拟"窗口后面的桌面"）----
-    // 里程碑 3 会用真实桌面截图替换这块。
+///
+/// `backdrop` 为 None 时画测试图案（离屏调试用）。
+fn draw_frame(
+    surface: &mut Surface,
+    effect: &RuntimeEffect,
+    t: f32,
+    backdrop: Option<&skia_safe::Image>,
+) {
+    // ---- 背景 ----
+    // 有真实抓屏就用它；没有就画测试图案（离屏调试用）。
     {
         let canvas = surface.canvas();
         canvas.clear(Color::TRANSPARENT);
 
-        let colors = [
-            Color::from_rgb(255, 59, 107),
-            Color::from_rgb(255, 201, 60),
-            Color::from_rgb(46, 204, 113),
-            Color::from_rgb(74, 125, 255),
-            Color::from_rgb(168, 85, 247),
-            Color::from_rgb(0, 200, 220),
-        ];
-        for (i, c) in colors.iter().enumerate() {
-            let mut p = Paint::default();
-            p.set_color(*c);
-            p.set_anti_alias(true);
-            let cw = W as f32 / 3.0;
-            let ch = H as f32 / 2.0;
-            let x = (i as f32 % 3.0) * cw;
-            let y = (i as f32 / 3.0) * ch;
-            canvas.draw_rect(Rect::from_xywh(x, y, cw, ch), &p);
-        }
+        if let Some(img) = backdrop {
+            // 直接把桌面截图铺满，作为玻璃的"背景"
+            canvas.draw_image(img, (0, 0), None);
+        } else {
+            let colors = [
+                Color::from_rgb(255, 59, 107),
+                Color::from_rgb(255, 201, 60),
+                Color::from_rgb(46, 204, 113),
+                Color::from_rgb(74, 125, 255),
+                Color::from_rgb(168, 85, 247),
+                Color::from_rgb(0, 200, 220),
+            ];
+            for (i, c) in colors.iter().enumerate() {
+                let mut p = Paint::default();
+                p.set_color(*c);
+                p.set_anti_alias(true);
+                let cw = W as f32 / 3.0;
+                let ch = H as f32 / 2.0;
+                let x = (i as f32 % 3.0) * cw;
+                let y = (i as f32 / 3.0) * ch;
+                canvas.draw_rect(Rect::from_xywh(x, y, cw, ch), &p);
+            }
 
-        // 滚动的细线：折射后扭曲会很明显
-        let mut line = Paint::default();
-        line.set_color(Color::WHITE);
-        line.set_style(PaintStyle::Stroke);
-        line.set_stroke_width(2.0);
-        let offset = (t * 40.0) % 22.0;
-        let mut y = offset - 22.0;
-        while y < H as f32 {
-            canvas.draw_line((0.0, y), (W as f32, y), &line);
-            y += 22.0;
+            // 滚动的细线：折射后扭曲会很明显（只在测试图案下画）
+            let mut line = Paint::default();
+            line.set_color(Color::WHITE);
+            line.set_style(PaintStyle::Stroke);
+            line.set_stroke_width(2.0);
+            let offset = (t * 40.0) % 22.0;
+            let mut y = offset - 22.0;
+            while y < H as f32 {
+                canvas.draw_line((0.0, y), (W as f32, y), &line);
+                y += 22.0;
+            }
         }
     } // 借用在这里结束，下面才能 snapshot
 
@@ -348,8 +424,24 @@ impl App {
         };
         let t = self.start.elapsed().as_secs_f32();
 
+        // 1) 抓取窗口背后的桌面（自己已被 WDA_EXCLUDEFROMCAPTURE 排除）
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        let backdrop_img = capture_screen(rect.left, rect.top, W, H).and_then(|pixels| {
+            let info = skia_safe::ImageInfo::new(
+                (W, H),
+                skia_safe::ColorType::BGRA8888,
+                skia_safe::AlphaType::Premul,
+                None,
+            );
+            skia_safe::images::raster_from_data(&info, Data::new_copy(&pixels), (W * 4) as usize)
+        });
+
+        // 2) 渲染一帧
         let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
-        draw_frame(&mut surface, effect, t);
+        draw_frame(&mut surface, effect, t, backdrop_img.as_ref());
 
         // 用 read_pixels 取出来（peek_pixels 在这个版本拿不到数据）
         let info = skia_safe::ImageInfo::new(
@@ -403,6 +495,14 @@ impl ApplicationHandler for App {
                 GWL_EXSTYLE,
                 ex | WS_EX_LAYERED.0 as isize | WS_EX_TOOLWINDOW.0 as isize,
             );
+
+            // 关键：把自己排除在屏幕捕获之外，否则抓背景会抓到自己的玻璃（无限套娃）
+            let ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            if ok.is_err() {
+                eprintln!("[警告] SetWindowDisplayAffinity 失败，抓背景会出现自反馈");
+            } else {
+                println!("已设置 WDA_EXCLUDEFROMCAPTURE（本窗口不进截图）");
+            }
         }
 
         let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL, None)
@@ -450,7 +550,7 @@ fn render_offscreen() {
     let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL, None)
         .unwrap_or_else(|e| panic!("SkSL 编译失败: {e}"));
     let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
-    draw_frame(&mut surface, &effect, 0.0);
+    draw_frame(&mut surface, &effect, 0.0, None);
 
     let image = surface.image_snapshot();
     let data = image
