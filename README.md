@@ -16,11 +16,21 @@ Windows 上的**真·液态玻璃**渲染实验：Skia + SkSL 运行时着色器
 | skia-safe 编译 | ✅ 通过（v0.156.0 + d3d） |
 | SkSL 着色器编译运行 | ✅ 通过 |
 | 折射 / 色散 / 高光 | ✅ 出效果（见 `liquid-glass-out.png`） |
-| 窗口 + 桌面抓取 | ⬜ 未做 |
+| **无边框透明置顶窗口** | ✅ 通过（见 `window-shot.png`） |
+| **桌面抓取** | ⬜ 下一步 |
+| 跟手高光 / 点击穿透 | ⬜ 未做 |
 
-现在跑的是**离屏渲染**：画一张图、存成 PNG，不涉及窗口。
+现在跑的是：**真窗口 + 假背景**。背景是程序画的彩色块，
+下一步用 Windows.Graphics.Capture 换成真实桌面。
+
+![窗口效果](window-shot.png)
 
 ## 怎么跑
+
+```powershell
+cargo run                # 开窗口（ESC 退出）
+cargo run -- --offscreen # 只渲染一张 PNG
+```
 
 ### ⚠️ 首次编译的坑：Skia 预编译包下不来
 
@@ -47,12 +57,27 @@ cargo run
 
 国内网络下 crates 走镜像：`~/.cargo/config.toml` 里配 rsproxy。
 
-## 下一步
+## 技术要点
 
-1. **窗口**：winit 建无边框透明窗口
-2. **抓背景**：Windows.Graphics.Capture 抓窗口背后的画面
-3. **合成**：Skia D3D12 后端 + DirectComposition 上屏
-4. **交互**：跟随鼠标的高光、点击穿透
+### 透明窗口怎么做的
+
+`WS_EX_LAYERED` + `UpdateLayeredWindow`：Skia 画到内存位图 → 拷进 32 位 DIB →
+一次 `UpdateLayeredWindow` 上屏。逐像素 alpha，不需要 D3D12/DirectComposition。
+
+三个坑：
+
+1. **`pt_dst` 必须传窗口当前位置**，否则 ULW 会把窗口挪到 (0,0)。
+2. **`peek_pixels()` 拿不到数据**（返回的 Pixmap 里 `pixels()` 是 `None`），
+   要用 `surface.read_pixels(&info, &mut buf, row_bytes, (0,0))`。
+3. **canvas 的可变借用会挡住 `image_snapshot()`**，画背景要用 `{ }` 包住作用域。
+
+### 下一步
+
+1. **抓背景**：`Windows.Graphics.Capture` 抓窗口背后的桌面
+   - 注意：自己的窗口会被抓进去 → 形成反馈循环
+   - 解法：`SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` 把自己排除在捕获之外
+2. **跟手高光**：鼠标位置 → `lightAngle` uniform
+3. **点击穿透**：`WS_EX_TRANSPARENT`
 
 ## 许可证
 
