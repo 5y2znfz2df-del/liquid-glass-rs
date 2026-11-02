@@ -16,14 +16,14 @@ Windows 上的**真·液态玻璃**渲染实验：Skia + SkSL 运行时着色器
 | skia-safe 编译 | ✅ 通过（v0.156.0 + d3d） |
 | SkSL 着色器编译运行 | ✅ 通过 |
 | 折射 / 色散 / 高光 | ✅ 出效果（见 `liquid-glass-out.png`） |
-| **无边框透明置顶窗口** | ✅ 通过（见 `window-shot.png`） |
-| **桌面抓取** | ⬜ 下一步 |
+| 无边框透明置顶窗口 | ✅ 通过（见 `window-shot.png`） |
+| **抓真实桌面当背景** | ✅ **通过**（见 `real-desktop.png`） |
 | 跟手高光 / 点击穿透 | ⬜ 未做 |
 
-现在跑的是：**真窗口 + 假背景**。背景是程序画的彩色块，
-下一步用 Windows.Graphics.Capture 换成真实桌面。
+**现在是一个真的能跑的液态玻璃窗口了**：玻璃里显示的是窗口背后的真实桌面
+（文字、图片都会被折射掰弯）。
 
-![窗口效果](window-shot.png)
+![真实桌面透过玻璃](real-desktop.png)
 
 ## 怎么跑
 
@@ -71,13 +71,33 @@ cargo run
    要用 `surface.read_pixels(&info, &mut buf, row_bytes, (0,0))`。
 3. **canvas 的可变借用会挡住 `image_snapshot()`**，画背景要用 `{ }` 包住作用域。
 
+### 抓桌面怎么做的
+
+一开始想用 Windows.Graphics.Capture（WinRT），但那是异步帧回调 + D3D11 设备，
+接线复杂。**实测 BitBlt 就够了**：
+
+```rust
+BitBlt(memDC, 0, 0, w, h, screenDC, x, y, SRCCOPY)   // 抓窗口所在区域
+GetDIBits(memDC, bmp, ...)                            // 取出 BGRA 像素
+```
+
+关键是**必须先把窗口排除在捕获之外**，否则会抓到自己的玻璃 → 无限套娃：
+
+```rust
+SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+```
+
+实测（2026-11-02）：设了之后 BitBlt 抓到的是**窗口背后的真实桌面**，
+不是黑块、不是自己的画面。A/B 对比验证过。
+
+代价：BitBlt 抓不到硬件加速的内容（视频播放器、游戏画面可能全黑）。
+要支持那些得换 Windows.Graphics.Capture。
+
 ### 下一步
 
-1. **抓背景**：`Windows.Graphics.Capture` 抓窗口背后的桌面
-   - 注意：自己的窗口会被抓进去 → 形成反馈循环
-   - 解法：`SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` 把自己排除在捕获之外
-2. **跟手高光**：鼠标位置 → `lightAngle` uniform
-3. **点击穿透**：`WS_EX_TRANSPARENT`
+1. **跟手高光**：鼠标位置 → 调整 `lightAngle` uniform
+2. **点击穿透**：`WS_EX_TRANSPARENT`
+3. **性能优化**：现在每帧都新建 Skia surface + 抓屏，可以复用
 
 ## 许可证
 
