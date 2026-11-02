@@ -1,0 +1,38 @@
+liquid-glass-rs
+Copyright (C) 2026 XiangFu
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+---
+
+完整的 GPLv3 协议全文请从以下地址获取（本文件仅为标准声明）：
+
+    https://www.gnu.org/licenses/gpl-3.0.txt
+
+发布到 GitHub / GitLab 前，请把上述全文另存为 LICENSE，或用
+GitHub 的「Add license → GNU General Public License v3.0」模板替换本文件。
+
+## 关于第三方参考
+
+本项目的着色器为原创实现，用的是公开的光学原理（斯涅尔折射定律、
+RGB 三通道色散、圆角矩形有符号距离场、Blinn-Phong 高光）。
+
+设计思路参考了：
+
+- Apple Liquid Glass 的公开设计（无源码）
+- WinIsland《灵动岛》(https://gitlab.com/Eatgrapes/winisland, GPLv3) 的公开效果
+- neeldedkawala/ios-siri-animation (MIT) 的玻璃波光效果
+
+**未复制上述项目中的任何代码。** 如果后续引入他人 GPLv3 代码，
+本项目作为整体保持 GPLv3，符合协议要求。
