@@ -29,10 +29,11 @@ use windows::Win32::Graphics::Gdi::{
     GetDC, GetDIBits, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO,
     BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_T};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    GetCursorPos, GetWindowLongPtrW, GetWindowRect, SetWindowDisplayAffinity, SetWindowLongPtrW,
     UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -193,6 +194,7 @@ fn draw_frame(
     effect: &RuntimeEffect,
     t: f32,
     backdrop: Option<&skia_safe::Image>,
+    light_angle: f32,
 ) {
     // ---- 背景 ----
     // 有真实抓屏就用它；没有就画测试图案（离屏调试用）。
@@ -254,22 +256,24 @@ fn draw_frame(
         rect_h,
         W as f32 / 2.0,
         H as f32 / 2.0,
-        48.0,
-        30.0,
-        40.0,
-        1.42,
-        0.04,
-        2.2,
-        0.08,
+        52.0,        // corner
+        38.0,        // bezel：边缘折射带
+        34.0,        // thickness：玻璃厚度
+        1.42,        // ior
+        0.05,        // dispersion
+        light_angle, // 跟手：光源方向 = 光标相对玻璃中心的方位角
+        0.10,        // tintAmount
         0.0,
+        0.90,
         0.92,
         0.95,
-        0.98,
         1.0,
     ];
     let bytes: Vec<u8> = uniform.iter().flat_map(|f| f.to_le_bytes()).collect();
 
     if let Some(shader) = effect.make_shader(Data::new_copy(&bytes), &[bg_shader.into()], None) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("[调试] 着色器创建成功, lightAngle={light_angle:.3}"));
         let mut paint = Paint::default();
         paint.set_shader(shader);
         paint.set_anti_alias(true);
@@ -281,7 +285,18 @@ fn draw_frame(
         );
         // 重新借一次 canvas 画玻璃
         let canvas = surface.canvas();
-        canvas.draw_rrect(RRect::new_rect_xy(rect, 48.0, 48.0), &paint);
+        canvas.draw_rrect(RRect::new_rect_xy(rect, 52.0, 52.0), &paint);
+
+        // 描边：让玻璃边界在白底上也看得见
+        let mut edge = Paint::default();
+        edge.set_style(PaintStyle::Stroke);
+        edge.set_stroke_width(1.2);
+        edge.set_anti_alias(true);
+        edge.set_color(Color::from_argb(70, 255, 255, 255));
+        canvas.draw_rrect(RRect::new_rect_xy(rect, 52.0, 52.0), &edge);
+    } else {
+        static ONCE2: std::sync::Once = std::sync::Once::new();
+        ONCE2.call_once(|| eprintln!("[错误] make_shader 返回 None，uniform {} 字节", bytes.len()));
     }
 }
 
@@ -405,6 +420,18 @@ struct App {
     dib: Option<Dib>,
     hwnd: HWND,
     start: Instant,
+    /// 复用的 Skia 画布（避免每帧重新分配）
+    surface: Option<Surface>,
+    /// 复用的像素缓冲
+    buf: Vec<u8>,
+    /// 是否处于点击穿透状态
+    click_through: bool,
+    /// 上一帧的按键状态，用于边沿检测
+    prev_esc: bool,
+    prev_t: bool,
+    /// 调试：把渲染帧存到这个路径，然后退出
+    dump_path: Option<String>,
+    frames: u32,
 }
 
 impl App {
@@ -415,14 +442,75 @@ impl App {
             dib: None,
             hwnd: HWND(std::ptr::null_mut()),
             start: Instant::now(),
+            surface: None,
+            buf: Vec::new(),
+            click_through: false,
+            prev_esc: false,
+            prev_t: false,
+            dump_path: None,
+            frames: 0,
         }
     }
 
+    /// 切换点击穿透（WS_EX_TRANSPARENT）
+    fn toggle_click_through(&mut self) {
+        self.click_through = !self.click_through;
+        unsafe {
+            let ex = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let new = if self.click_through {
+                ex | WS_EX_TRANSPARENT.0 as isize
+            } else {
+                ex & !(WS_EX_TRANSPARENT.0 as isize)
+            };
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, new);
+        }
+    }
+
+    /// 用 GetAsyncKeyState 轮询按键，不受窗口焦点影响
+    /// （穿透模式下窗口拿不到焦点，普通键盘事件收不到）
+    fn poll_keys(&mut self) -> bool {
+        unsafe {
+            let esc = (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8001) != 0;
+            let t = (GetAsyncKeyState(VK_T.0 as i32) as u16 & 0x8001) != 0;
+
+            let mut quit = false;
+            if esc && !self.prev_esc {
+                quit = true;
+            }
+            if t && !self.prev_t {
+                self.toggle_click_through();
+                // 给个视觉反馈：标题栏（这里没有）→ 用控制台输出不了，
+                // 所以靠手感；穿透后鼠标直接穿过窗口
+            }
+            self.prev_esc = esc;
+            self.prev_t = t;
+            quit
+        }
+    }
+
+    /// 光标相对玻璃中心的方位角（弧度），用于跟手高光
+    fn light_angle(&self) -> f32 {
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rect);
+        }
+        let cx = pt.x - rect.left;
+        let cy = pt.y - rect.top;
+        let dx = cx as f32 - W as f32 / 2.0;
+        let dy = cy as f32 - H as f32 / 2.0;
+        dy.atan2(dx)
+    }
+
     fn draw(&mut self) {
-        let (Some(window), Some(effect), Some(dib)) = (&self.window, &self.effect, &self.dib) else {
+        let (Some(_window), Some(effect), Some(dib)) = (&self.window, &self.effect, &self.dib) else {
             return;
         };
         let t = self.start.elapsed().as_secs_f32();
+        let angle = self.light_angle();
 
         // 1) 抓取窗口背后的桌面（自己已被 WDA_EXCLUDEFROMCAPTURE 排除）
         let mut rect = windows::Win32::Foundation::RECT::default();
@@ -439,9 +527,11 @@ impl App {
             skia_safe::images::raster_from_data(&info, Data::new_copy(&pixels), (W * 4) as usize)
         });
 
-        // 2) 渲染一帧
-        let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
-        draw_frame(&mut surface, effect, t, backdrop_img.as_ref());
+        // 2) 渲染一帧（复用 surface，不每帧重新分配）
+        let surface = self
+            .surface
+            .get_or_insert_with(|| surfaces::raster_n32_premul((W, H)).expect("surface"));
+        draw_frame(surface, effect, t, backdrop_img.as_ref(), angle);
 
         // 用 read_pixels 取出来（peek_pixels 在这个版本拿不到数据）
         let info = skia_safe::ImageInfo::new(
@@ -450,17 +540,34 @@ impl App {
             skia_safe::AlphaType::Premul,
             None,
         );
-        let mut buf = vec![0u8; (W * H * 4) as usize];
-        let ok = surface.read_pixels(&info, &mut buf, (W * 4) as usize, (0, 0));
-
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| eprintln!("[调试] 第一次 draw: read_pixels={ok}"));
+        // 复用缓冲，避免每帧 vec![0u8; ...] 分配
+        if self.buf.len() != (W * H * 4) as usize {
+            self.buf = vec![0u8; (W * H * 4) as usize];
+        }
+        let ok = surface.read_pixels(&info, &mut self.buf, (W * 4) as usize, (0, 0));
 
         if ok {
-            dib.blit(self.hwnd, &buf);
+            dib.blit(self.hwnd, &self.buf);
         }
 
-        window.request_redraw();
+        // 调试：跑够若干帧后把渲染结果存盘（绕过截屏，看到的就是真实渲染）
+        if let Some(path) = &self.dump_path {
+            self.frames += 1;
+            if self.frames >= 60 {
+                if let Some(surface) = &mut self.surface {
+                    let img = surface.image_snapshot();
+                    if let Some(data) = img.encode(None, EncodedImageFormat::PNG, 100) {
+                        let _ = fs::write(path, data.as_bytes());
+                        println!("已保存渲染帧 -> {path}");
+                    }
+                }
+                std::process::exit(0);
+            }
+        }
+
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
     }
 }
 
@@ -497,11 +604,17 @@ impl ApplicationHandler for App {
             );
 
             // 关键：把自己排除在屏幕捕获之外，否则抓背景会抓到自己的玻璃（无限套娃）
-            let ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-            if ok.is_err() {
-                eprintln!("[警告] SetWindowDisplayAffinity 失败，抓背景会出现自反馈");
+            // 调试时用 --no-exclude 关掉，这样才能截到窗口本身来验证渲染
+            let no_exclude = std::env::args().any(|a| a == "--no-exclude");
+            if no_exclude {
+                println!("[调试] 已跳过 WDA_EXCLUDEFROMCAPTURE（截图可以看到窗口）");
             } else {
-                println!("已设置 WDA_EXCLUDEFROMCAPTURE（本窗口不进截图）");
+                let ok = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                if ok.is_err() {
+                    eprintln!("[警告] SetWindowDisplayAffinity 失败，抓背景会出现自反馈");
+                } else {
+                    println!("已设置 WDA_EXCLUDEFROMCAPTURE（本窗口不进截图）");
+                }
             }
         }
 
@@ -538,7 +651,12 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // 轮询按键（穿透模式下窗口没焦点，收不到普通键盘事件）
+        if self.window.is_some() && self.poll_keys() {
+            event_loop.exit();
+            return;
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -550,7 +668,7 @@ fn render_offscreen() {
     let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL, None)
         .unwrap_or_else(|e| panic!("SkSL 编译失败: {e}"));
     let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
-    draw_frame(&mut surface, &effect, 0.0, None);
+    draw_frame(&mut surface, &effect, 0.0, None, 2.2);
 
     let image = surface.image_snapshot();
     let data = image
@@ -570,5 +688,13 @@ fn main() {
 
     let event_loop = EventLoop::new().expect("事件循环创建失败");
     let mut app = App::new();
+
+    // 调试：--dump-frame <path> 跑 60 帧后把渲染结果存盘退出
+    if let Some(i) = args.iter().position(|a| a == "--dump-frame") {
+        if let Some(p) = args.get(i + 1) {
+            app.dump_path = Some(p.clone());
+        }
+    }
+
     event_loop.run_app(&mut app).expect("运行失败");
 }
