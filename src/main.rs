@@ -60,9 +60,15 @@ uniform float  dispersion;
 uniform float  lightAngle;
 uniform float  tintAmount;
 uniform float  pad0;
-uniform float2 blobPos;
-uniform float  blobR;
+uniform float2 blob0Pos;
+uniform float  blob0R;
 uniform float  pad1;
+uniform float2 blob1Pos;
+uniform float  blob1R;
+uniform float  pad2;
+uniform float2 blob2Pos;
+uniform float  blob2R;
+uniform float  pad3;
 uniform float4 tintColor;
 
 // 圆角矩形的有符号距离场
@@ -77,11 +83,18 @@ float smin(float a, float b, float k) {
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-// 整个玻璃的形状 = 主体矩形 ∪ 跟手小圆
+// 整个玻璃的形状 = 主体矩形 ∪ 若干跟手小圆
+//
+// 三个小圆 = 光标当前位置 + 前两个历史位置（半径递减），
+// 快速移动光标时会拉出一条液态拖尾，多个圆跟主体平滑融合。
 float sceneD(float2 p) {
     float d = sdRoundRect(p, rectSize * 0.5, corner);
-    if (blobR > 0.5) {
-        d = smin(d, length(p - blobPos) - blobR, 30.0);
+    d = smin(d, length(p - blob0Pos) - blob0R, 30.0);
+    if (blob1R > 0.5) {
+        d = smin(d, length(p - blob1Pos) - blob1R, 24.0);
+    }
+    if (blob2R > 0.5) {
+        d = smin(d, length(p - blob2Pos) - blob2R, 18.0);
     }
     return d;
 }
@@ -248,8 +261,8 @@ fn draw_frame(
     t: f32,
     backdrop: Option<&skia_safe::Image>,
     light_angle: f32,
-    blob_pos: (f32, f32),
-    blob_r: f32,
+    // 三个跟手小圆：(x, y, 半径)，都相对玻璃中心
+    blobs: [(f32, f32, f32); 3],
     // 只画玻璃不画背景（调试：PNG 的 alpha 就是玻璃轮廓，方便量化验证）
     glass_only: bool,
 ) {
@@ -317,8 +330,8 @@ fn draw_frame(
     let rect_w = 420.0f32;
     let rect_h = 240.0f32;
     // 布局必须和 SkSL 里的 uniform 声明一一对应（含 16 字节对齐的 float4）
-    // 0 rectSize | 2 center | 4..11 标量 | 12 blobPos | 14 blobR | 16 tintColor
-    let uniform: [f32; 20] = [
+    // 0 rectSize | 2 center | 4..11 标量 | 12..15 blob0 | 16..19 blob1 | 20..23 blob2 | 24 tintColor（共 28 个 float = 112 字节）
+    let uniform: [f32; 28] = [
         rect_w,
         rect_h,
         W as f32 / 2.0,
@@ -331,10 +344,18 @@ fn draw_frame(
         light_angle,    // 跟手：光源方向 = 光标相对玻璃中心的方位角
         0.10,           // tintAmount
         0.0,            // pad0（对齐用）
-        blob_pos.0,     // blobPos：跟手小圆的位置（相对玻璃中心）
-        blob_pos.1,
-        blob_r,         // blobR：小圆半径，0 = 不融合
+        blobs[0].0,     // blob0Pos：跟手小圆的位置（相对玻璃中心）
+        blobs[0].1,
+        blobs[0].2,     // blob0R：半径，0 = 不融合
         0.0,            // pad1
+        blobs[1].0,     // blob1Pos：拖尾第二个
+        blobs[1].1,
+        blobs[1].2,     // blob1R
+        0.0,            // pad2
+        blobs[2].0,     // blob2Pos：拖尾第三个
+        blobs[2].1,
+        blobs[2].2,     // blob2R
+        0.0,            // pad3
         0.90,           // tintColor
         0.92,
         0.95,
@@ -578,8 +599,10 @@ struct App {
     dump_path: Option<String>,
     frames: u32,
     /// 跟手小圆（液态融合）：当前半径和位置，插值出来的所以有"甩"的惯性
-    blob_r: f32,
-    blob_pos: (f32, f32),
+    /// 三个跟手小圆：(x, y, 半径)，相对玻璃中心
+    blobs: [(f32, f32, f32); 3],
+    /// 光标轨迹（最近 3 个位置），用来做液态拖尾
+    trail: [(f32, f32); 3],
     /// 上一帧的时间，用来算 dt（让插值和帧率无关）
     last_frame: Instant,
     /// 只画玻璃不画背景（调试）
@@ -587,7 +610,7 @@ struct App {
     /// 调试计数器
     dbg_n: u32,
     /// 调试：强制指定融合小圆的位置和半径（不受鼠标影响）
-    blob_override: Option<(f32, f32, f32)>,
+    blob_override: Option<[(f32, f32, f32); 3]>,
     /// 抓屏缓冲，复用避免每帧分配
     cap_buf: Vec<u8>,
     /// 缓存的背景图（隔帧刷新）
@@ -620,8 +643,8 @@ impl App {
             prev_t: false,
             dump_path: None,
             frames: 0,
-            blob_r: 0.0,
-            blob_pos: (0.0, 0.0),
+            blobs: [(0.0, 0.0, 0.0); 3],
+            trail: [(0.0, 0.0); 3],
             last_frame: Instant::now(),
             glass_only: false,
             dbg_n: 0,
@@ -657,8 +680,17 @@ impl App {
     /// （穿透模式下窗口拿不到焦点，普通键盘事件收不到）
     fn poll_keys(&mut self) -> bool {
         unsafe {
-            let esc = (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8001) != 0;
-            let t = (GetAsyncKeyState(VK_T.0 as i32) as u16 & 0x8001) != 0;
+            let esc_raw = GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16;
+            let t_raw = GetAsyncKeyState(VK_T.0 as i32) as u16;
+            let esc = (esc_raw & 0x8001) != 0;
+            let t = (t_raw & 0x8001) != 0;
+
+            if cfg!(debug_assertions) {
+                // 只在状态变化时打印，免得刷屏
+                if esc != self.prev_esc || t != self.prev_t {
+                    eprintln!("[按键] ESC原始={esc_raw:#06x} T原始={t_raw:#06x}");
+                }
+            }
 
             let mut quit = false;
             if esc && !self.prev_esc {
@@ -707,55 +739,71 @@ impl App {
 
     /// 跟手小圆：光标靠近玻璃边缘时，玻璃朝光标鼓起一个包。
     ///
-    /// 位置和半径都做插值，所以快速移动光标时会有液态的甩尾。
+    /// 三个小圆 = 光标当前位置 + 两个历史位置（半径递减），
+    /// 快速移动光标时会拉出一条液态拖尾，全都跟主体平滑融合。
     fn update_blob(&mut self, dt: f32) {
-        // 调试覆盖：--blob x,y,r 直接指定融合小圆，不受真实鼠标影响
-        if let Some((x, y, r)) = self.blob_override {
-            self.blob_pos = (x, y);
-            self.blob_r = r;
+        // 调试覆盖：--blob 直接指定融合小圆，不受真实鼠标影响
+        if let Some(bs) = self.blob_override {
+            self.blobs = bs;
             return;
         }
         let (cx, cy) = self.cursor_local();
-        let half_w = 210.0f32;
-        let half_h = 120.0f32;
-        let len = (cx * cx + cy * cy).sqrt();
 
-        let mut bx = 0.0f32;
-        let mut by = 0.0f32;
-        let mut target = 0.0f32;
-
-        if len > 1.0 {
-            let dir_x = cx / len;
-            let dir_y = cy / len;
-            // 从中心沿光标方向射到矩形边界
-            let tx = if dir_x.abs() > 1e-4 {
-                half_w / dir_x.abs()
-            } else {
-                f32::MAX
-            };
-            let ty = if dir_y.abs() > 1e-4 {
-                half_h / dir_y.abs()
-            } else {
-                f32::MAX
-            };
-            let t = tx.min(ty);
-            bx = dir_x * t;
-            by = dir_y * t;
-
-            let outside = len - t; // >0 表示光标在玻璃外面
-            let dist = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt();
-            if outside > -6.0 {
-                // 越贴近边缘包越大，离远了就收回去
-                target = 46.0 * (1.0 - (dist - 10.0) / 120.0).clamp(0.0, 1.0);
-            }
+        // 记轨迹：光标移动超过 6px 就往前挪一格（形成滞后）
+        let moved = ((cx - self.trail[0].0).powi(2) + (cy - self.trail[0].1).powi(2)).sqrt();
+        self.trail[0] = (cx, cy);
+        if moved > 6.0 {
+            self.trail[2] = self.trail[1];
+            self.trail[1] = self.trail[0];
         }
 
+        let half_w = 210.0f32;
+        let half_h = 120.0f32;
         let k = (dt * 9.0).min(1.0);
-        self.blob_r += (target - self.blob_r) * k;
-        self.blob_pos.0 += (bx - self.blob_pos.0) * k;
-        self.blob_pos.1 += (by - self.blob_pos.1) * k;
-        if self.blob_r < 0.4 {
-            self.blob_r = 0.0;
+
+        // 每个小圆的基准半径：越靠后越小
+        const BASE_R: [f32; 3] = [46.0, 34.0, 24.0];
+
+        for i in 0..3 {
+            let (sx, sy) = self.trail[i];
+            let len = (sx * sx + sy * sy).sqrt();
+            let mut bx = 0.0f32;
+            let mut by = 0.0f32;
+            let mut target = 0.0f32;
+
+            if len > 1.0 {
+                let dir_x = sx / len;
+                let dir_y = sy / len;
+                // 从中心沿光标方向射到矩形边界
+                let tx = if dir_x.abs() > 1e-4 {
+                    half_w / dir_x.abs()
+                } else {
+                    f32::MAX
+                };
+                let ty = if dir_y.abs() > 1e-4 {
+                    half_h / dir_y.abs()
+                } else {
+                    f32::MAX
+                };
+                let t = tx.min(ty);
+                bx = dir_x * t;
+                by = dir_y * t;
+
+                let outside = len - t; // >0 表示光标在玻璃外面
+                let dist = ((sx - bx).powi(2) + (sy - by).powi(2)).sqrt();
+                if outside > -6.0 {
+                    // 越贴近边缘包越大，离远了就收回去
+                    target = BASE_R[i] * (1.0 - (dist - 10.0) / 120.0).clamp(0.0, 1.0);
+                }
+            }
+
+            let b = &mut self.blobs[i];
+            b.2 += (target - b.2) * k;
+            b.0 += (bx - b.0) * k;
+            b.1 += (by - b.1) * k;
+            if b.2 < 0.4 {
+                b.2 = 0.0;
+            }
         }
 
         // 调试日志只在 debug 构建里打，release 版本保持安静
@@ -763,9 +811,12 @@ impl App {
         if cfg!(debug_assertions) && self.dbg_n % 20 == 1 {
             let (pt, rect) = self.cursor_and_rect();
             eprintln!(
-                "[blob] 光标=({},{}) 窗口=({},{}) 局部=({:.0},{:.0}) 目标r={:.1} 当前r={:.1} 位置=({:.0},{:.0})",
-                pt.x, pt.y, rect.left, rect.top, cx, cy,
-                target, self.blob_r, self.blob_pos.0, self.blob_pos.1
+                "[blob] 光标=({},{}) 窗口=({},{}) 小圆 r=({:.0},{:.0},{:.0}) 位置=({:.0},{:.0})/({:.0},{:.0})/({:.0},{:.0})",
+                pt.x, pt.y, rect.left, rect.top,
+                self.blobs[0].2, self.blobs[1].2, self.blobs[2].2,
+                self.blobs[0].0, self.blobs[0].1,
+                self.blobs[1].0, self.blobs[1].1,
+                self.blobs[2].0, self.blobs[2].1
             );
         }
         self.fps_n += 1;
@@ -853,8 +904,7 @@ impl App {
             t,
             self.backdrop.as_ref(),
             angle,
-            self.blob_pos,
-            self.blob_r,
+            self.blobs,
             glass_only,
         );
         let ms_rnd = t_rnd.elapsed().as_secs_f32() * 1000.0;
@@ -1034,7 +1084,15 @@ fn render_offscreen() {
     let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL, None)
         .unwrap_or_else(|e| panic!("SkSL 编译失败: {e}"));
     let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
-    draw_frame(&mut surface, &effect, 0.0, None, 2.2, (0.0, 0.0), 0.0, false);
+    draw_frame(
+        &mut surface,
+        &effect,
+        0.0,
+        None,
+        2.2,
+        [(0.0, 0.0, 0.0); 3],
+        false,
+    );
 
     let image = surface.image_snapshot();
     let data = image
@@ -1068,14 +1126,26 @@ fn main() {
         app.glass_only = true;
     }
     // 调试：--blob x,y,r 强制指定融合小圆（不受真实鼠标干扰，方便自动化验证）
+    // 可以写多组，用分号隔开：--blob "10,20,30;100,50,24"
     if let Some(i) = args.iter().position(|a| a == "--blob") {
         if let Some(v) = args.get(i + 1) {
-            let nums: Vec<f32> = v
-                .split(',')
-                .filter_map(|s| s.trim().parse::<f32>().ok())
-                .collect();
-            if nums.len() == 3 {
-                app.blob_override = Some((nums[0], nums[1], nums[2]));
+            let mut blobs = [(0.0f32, 0.0f32, 0.0f32); 3];
+            let mut n = 0;
+            for group in v.split(';') {
+                if n >= 3 {
+                    break;
+                }
+                let nums: Vec<f32> = group
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<f32>().ok())
+                    .collect();
+                if nums.len() == 3 {
+                    blobs[n] = (nums[0], nums[1], nums[2]);
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                app.blob_override = Some(blobs);
             }
         }
     }

@@ -19,14 +19,14 @@ Windows 上的**真·液态玻璃**渲染实验：Skia + SkSL 运行时着色器
 | 无边框透明置顶窗口 | ✅ 通过 |
 | 抓真实桌面当背景 | ✅ 通过 |
 | **跟手高光** | ✅ 光标方向决定光照方位 |
-| **液态融合形变** | ✅ 光标靠近边缘，玻璃鼓起一个包（smin 平滑并集） |
+| **液态融合形变** | ✅ 三个跟手小圆 + 液态拖尾（smin 平滑并集） |
 | **点击穿透** | ✅ 按 `T` 切换 |
 | **拖拽移动 + 位置记忆** | ✅ 下次启动回到原位 |
 | 性能 | ✅ 18.5 → **26 FPS**（复用 surface/缓冲、抓屏隔帧、着色器省 2/3 的 SDF 调用） |
 | 打包 | ✅ release 5.3 MB，带图标和版本信息 |
 
 **现在是一个能跑的液态玻璃窗口**：玻璃里显示窗口背后的真实桌面，文字被折射掰弯，
-高光跟着光标转。
+高光跟着光标转，光标扫过边缘会拖出一条液态的鼓包。
 
 ![真实渲染](final-frame.png)
 
@@ -52,7 +52,7 @@ Windows 上的**真·液态玻璃**渲染实验：Skia + SkSL 运行时着色器
 | `--offscreen` | 只渲一张 PNG（测试图案背景） |
 | `--dump-frame <路径>` | 跑 60 帧后把渲染结果存盘退出 |
 | `--glass-only` | 只画玻璃不画背景，PNG 的 alpha 就是玻璃轮廓 |
-| `--blob x,y,r` | 强制指定融合小圆（不受真实鼠标干扰，方便自动化验证） |
+| `--blob "x,y,r;x,y,r;x,y,r"` | 强制指定融合小圆（最多三组，分号隔开；不受真实鼠标干扰，方便自动化验证） |
 | `--no-exclude` | 不设 `WDA_EXCLUDEFROMCAPTURE`（调试用，见下方警告） |
 
 ### 怎么量化验证效果
@@ -68,11 +68,12 @@ python tools/measure_refraction.py liquid-glass-out.png
 
 ```powershell
 # 融合形变：看玻璃轮廓有没有被撑开
-cargo run -- --glass-only --blob 0,0,0     --dump-frame shape-none.png
-cargo run -- --glass-only --blob 210,0,46  --dump-frame shape-bulge.png
+cargo run --release -- --glass-only --blob "0,0,0"                                  --dump-frame shape-none.png
+cargo run --release -- --glass-only --blob "235,20,44"                              --dump-frame shape-one.png
+cargo run --release -- --glass-only --blob "235,20,44;150,145,34;-150,-130,26"      --dump-frame shape-three.png
 ```
 
-两个 PNG 的包围盒对比，能看出小圆把轮廓撑出去多少。
+对比几个 PNG 的包围盒，能看出每个小圆各把轮廓撑出去多少。
 
 ### ⚠️ 怎么截到自己的窗口
 
@@ -195,20 +196,32 @@ float sdRoundRect(float2 p, float2 halfSize, float r) { ... }  // 圆角矩形
 float smin(float a, float b, float k) { ... }                   // 平滑并集
 float sceneD(float2 p) {                                        // 整体形状
     float d = sdRoundRect(p, rectSize * 0.5, corner);
-    if (blobR > 0.5) { d = smin(d, length(p - blobPos) - blobR, 30.0); }
+    d = smin(d, length(p - blob0Pos) - blob0R, 30.0);
+    if (blob1R > 0.5) { d = smin(d, length(p - blob1Pos) - blob1R, 24.0); }
+    if (blob2R > 0.5) { d = smin(d, length(p - blob2Pos) - blob2R, 18.0); }
     return d;
 }
 ```
 
-`blobPos` / `blobR` 是跟手小圆的位置和半径，Rust 侧按光标位置算，
-每帧用 `dt` 插值（所以快速移动光标有液态的甩尾）。
+三组 `blobNPos` / `blobNR` 是**三个跟手小圆**：第一个贴光标当前位置，
+后两个是光标的历史位置（半径依次 46 / 34 / 24），快速移动光标时
+就拉出一条液态拖尾。Rust 侧每帧用 `dt` 插值，所以鼓包鼓起和收回都是软的。
 
-**法线用中心差分求**，因为融合后的形状没有解析梯度：
+实测（`--glass-only` 数非透明像素的包围盒）：
+
+| 小圆 | 包围盒 |
+| --- | --- |
+| 0 个 | x[100..519] y[90..329] 面积 98444 |
+| 1 个（右下） | x[100..**588**] 面积 103858 |
+| 2 个（+下） | y[90..**388**] 面积 107411 |
+| 3 个（+左上） | y[**54**..388] 面积 109087 |
+
+**法线用前向差分求**，因为融合后的形状没有解析梯度：
 
 ```glsl
 float2 grad = float2(
-    sceneD(local + float2(e, 0.0)) - sceneD(local - float2(e, 0.0)),
-    sceneD(local + float2(0.0, e)) - sceneD(local - float2(0.0, e))
+    sceneD(local + float2(e, 0.0)) - d,
+    sceneD(local + float2(0.0, e)) - d
 );
 ```
 
@@ -221,10 +234,10 @@ float2 grad = float2(
 
 ### 下一步
 
-1. **多块玻璃**：现在是单个小圆，要真正的多块融合得把 SDF 改成数组循环
-2. **真正的形变动画**：形态变化（比如滑入的方形变圆形）需要两个 shape 的权重混合
-3. **高 DPI**：现在不处理缩放，150% 缩放下窗口偏小
-4. **硬件加速内容**：BitBlt 抓不到，得换 Windows.Graphics.Capture
+1. **真正的形变动画**：形态变化（比如滑入的方形变圆形）需要两个 shape 的权重混合
+2. **高 DPI**：现在不处理缩放，150% 缩放下窗口偏小
+3. **硬件加速内容**：BitBlt 抓不到，得换 Windows.Graphics.Capture
+4. **GPU 渲染**：把 Skia 换到 D3D 后端，60 FPS 有希望
 
 ## 许可证
 
