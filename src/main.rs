@@ -92,22 +92,29 @@ half4 main(float2 coord) {
     float d = sceneD(local);
     if (d > 0.0) { return half4(0.0); }
 
-    // 形状可能是两个图形融出来的，没有解析梯度，用中心差分求法线
-    float e = 1.0;
-    float2 grad = float2(
-        sceneD(local + float2(e, 0.0)) - sceneD(local - float2(e, 0.0)),
-        sceneD(local + float2(0.0, e)) - sceneD(local - float2(0.0, e))
-    );
-    float glen = length(grad);
-    // 中轴线上梯度会退化，这时退回矩形的解析方向
-    float2 gRect = normalize(float2(
-        local.x / max(rectSize.x * 0.5, 1.0),
-        local.y / max(rectSize.y * 0.5, 1.0)
-    ) + float2(1e-5, 1e-5));
-    float2 g = glen > 0.002 ? grad / glen : gRect;
-
     float inward = -d;
     float band = clamp(inward / max(bezel, 0.001), 0.0, 1.0);
+
+    // 形状可能是两个图形融出来的，没有解析梯度，用差分求法线。
+    //
+    // 两个省时间的点：
+    // 1) 只有边缘带（band < 1）才用得到法线 —— 里面 slope=0，法线乘上去也是 0
+    // 2) 用前向差分（2 次 SDF）而不是中心差分（4 次 SDF）
+    float2 g = float2(0.0, 1.0);
+    if (band < 1.0) {
+        float e = 1.0;
+        float2 grad = float2(
+            sceneD(local + float2(e, 0.0)) - d,
+            sceneD(local + float2(0.0, e)) - d
+        );
+        float glen = length(grad);
+        // 中轴线上梯度会退化，这时退回矩形的解析方向
+        float2 gRect = normalize(float2(
+            local.x / max(rectSize.x * 0.5, 1.0),
+            local.y / max(rectSize.y * 0.5, 1.0)
+        ) + float2(1e-5, 1e-5));
+        g = glen > 0.002 ? grad / glen : gRect;
+    }
 
     float u = 1.0 - band;
     float slope = band < 1.0
@@ -151,25 +158,42 @@ half4 main(float2 coord) {
 "#;
 
 // ------------------------------------------------------------ 抓屏 --
-/// 抓取屏幕上一个矩形区域，返回 BGRA 像素（alpha 强制 255）。
+/// 抓取屏幕上一个矩形区域，BGRA 像素写进 `buf`（alpha 强制 255）。
 ///
 /// 因为窗口设了 WDA_EXCLUDEFROMCAPTURE，抓到的内容里**不含自己**，
 /// 所以拿到的就是"玻璃背后的桌面"。
-fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+///
+/// `buf` 由调用方复用，避免每帧重新分配 1MB。
+fn capture_screen(x: i32, y: i32, w: i32, h: i32, buf: &mut Vec<u8>) -> Option<()> {
     if w <= 0 || h <= 0 {
         return None;
     }
+    let need = (w * h * 4) as usize;
+    if buf.len() != need {
+        buf.resize(need, 0);
+    }
     unsafe {
         let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
         let mem = CreateCompatibleDC(Some(screen));
+        if mem.is_invalid() {
+            ReleaseDC(None, screen);
+            return None;
+        }
         let bmp = CreateCompatibleBitmap(screen, w, h);
         if bmp.is_invalid() {
+            // 这里必须把 mem 一起释放，否则每次失败都漏一个 DC
+            let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
             return None;
         }
         let old = SelectObject(mem, bmp.into());
 
+        let t0 = Instant::now();
         let ok = BitBlt(mem, 0, 0, w, h, Some(screen), x, y, SRCCOPY);
+        let ms_blt = t0.elapsed().as_secs_f32() * 1000.0;
 
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader = BITMAPINFOHEADER {
@@ -182,7 +206,7 @@ fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
             ..Default::default()
         };
 
-        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let t1 = Instant::now();
         let lines = GetDIBits(
             mem,
             bmp,
@@ -192,6 +216,10 @@ fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
             &mut bmi,
             DIB_RGB_COLORS,
         );
+        let ms_dib = t1.elapsed().as_secs_f32() * 1000.0;
+        if std::env::var_os("LG_DEBUG_CAPTURE").is_some() {
+            eprintln!("[抓屏] BitBlt {ms_blt:.1} ms | GetDIBits {ms_dib:.1} ms");
+        }
 
         SelectObject(mem, old);
         let _ = DeleteObject(bmp.into());
@@ -206,7 +234,7 @@ fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
         for i in (3..buf.len()).step_by(4) {
             buf[i] = 255;
         }
-        Some(buf)
+        Some(())
     }
 }
 
@@ -316,7 +344,26 @@ fn draw_frame(
 
     if let Some(shader) = effect.make_shader(Data::new_copy(&bytes), &[bg_shader.into()], None) {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| eprintln!("[调试] 着色器创建成功, lightAngle={light_angle:.3}"));
+        ONCE.call_once(|| {
+            // 自检：Skia 认为的 uniform 布局必须和我们的 20 个 f32（80 字节）对上，
+            // 否则 tintColor 会被挤到错的位置（表现为玻璃染色异常）
+            let us = effect.uniforms();
+            let total = us
+                .iter()
+                .map(|u| u.offset() + u.size_in_bytes())
+                .max()
+                .unwrap_or(0);
+            let mut layout = String::new();
+            for u in us {
+                layout.push_str(&format!(" {}=@{}+{}", u.name(), u.offset(), u.size_in_bytes()));
+            }
+            eprintln!("[调试] 着色器创建成功, lightAngle={light_angle:.3}");
+            eprintln!("[调试] uniform 布局 (共 {total} 字节):{layout}");
+            let expect = uniform.len() * 4;
+            if total != expect {
+                eprintln!("[警告] uniform 布局对不上（期望 {expect} 字节）！着色器读到的参数会错位");
+            }
+        });
         let mut paint = Paint::default();
         paint.set_shader(shader);
         paint.set_anti_alias(true);
@@ -541,6 +588,21 @@ struct App {
     dbg_n: u32,
     /// 调试：强制指定融合小圆的位置和半径（不受鼠标影响）
     blob_override: Option<(f32, f32, f32)>,
+    /// 抓屏缓冲，复用避免每帧分配
+    cap_buf: Vec<u8>,
+    /// 缓存的背景图（隔帧刷新）
+    backdrop: Option<skia_safe::Image>,
+    /// 帧计数（判断要不要重新抓屏）
+    frame_no: u32,
+    /// FPS 统计（debug 用）
+    fps_n: u32,
+    fps_t: Instant,
+    /// 每帧自己实际花掉的 CPU 毫秒（debug 用）
+    busy_ms: f32,
+    ms_cap: f32,
+    ms_rnd: f32,
+    ms_read: f32,
+    ms_blit: f32,
 }
 
 impl App {
@@ -564,6 +626,16 @@ impl App {
             glass_only: false,
             dbg_n: 0,
             blob_override: None,
+            cap_buf: Vec::new(),
+            backdrop: None,
+            frame_no: 0,
+            fps_n: 0,
+            fps_t: Instant::now(),
+            busy_ms: 0.0,
+            ms_cap: 0.0,
+            ms_rnd: 0.0,
+            ms_read: 0.0,
+            ms_blit: 0.0,
         }
     }
 
@@ -696,6 +768,29 @@ impl App {
                 target, self.blob_r, self.blob_pos.0, self.blob_pos.1
             );
         }
+        self.fps_n += 1;
+        if self.fps_n >= 60 {
+            let el = self.fps_t.elapsed().as_secs_f32();
+            let n = self.fps_n as f32;
+            eprintln!(
+                "[性能] {} 帧用了 {:.2} 秒 = {:.1} FPS\n         抓屏 {:.1} ms | 渲染 {:.1} ms | 读回 {:.1} ms | 上屏 {:.1} ms | 合计 {:.1} ms/帧",
+                self.fps_n,
+                el,
+                n / el,
+                self.ms_cap / n,
+                self.ms_rnd / n,
+                self.ms_read / n,
+                self.ms_blit / n,
+                self.busy_ms / n
+            );
+            self.fps_n = 0;
+            self.busy_ms = 0.0;
+            self.ms_cap = 0.0;
+            self.ms_rnd = 0.0;
+            self.ms_read = 0.0;
+            self.ms_blit = 0.0;
+            self.fps_t = Instant::now();
+        }
     }
 
     fn draw(&mut self) {
@@ -705,6 +800,7 @@ impl App {
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.update_blob(dt);
+        let t_frame = Instant::now();
 
         let (Some(_window), Some(effect), Some(dib)) = (&self.window, &self.effect, &self.dib) else {
             return;
@@ -719,21 +815,35 @@ impl App {
         }
         // --glass-only：跳过抓屏，PNG 的 alpha 就是玻璃轮廓
         let glass_only = self.glass_only;
-        let backdrop_img = if glass_only {
-            None
-        } else {
-            capture_screen(rect.left, rect.top, W, H).and_then(|pixels| {
-                let info = skia_safe::ImageInfo::new(
-                    (W, H),
-                    skia_safe::ColorType::BGRA8888,
-                    skia_safe::AlphaType::Premul,
-                    None,
-                );
-                skia_safe::images::raster_from_data(&info, Data::new_copy(&pixels), (W * 4) as usize)
-            })
-        };
+        let t_cap = Instant::now();
+        if !glass_only {
+            // 抓屏要等 DWM 合成，实测一次要 20ms（其中 10ms 是固定的同步开销）。
+            // 所以隔一帧抓一次，中间那帧复用上一张背景 —— 玻璃折射会晚一帧，
+            // 但帧率能翻倍，肉眼看不出差别。
+            self.frame_no += 1;
+            let need_capture = self.backdrop.is_none() || self.frame_no % 2 == 0;
+            if need_capture {
+                // 抓屏缓冲复用，避免每帧重新分配 1MB
+                let cap = &mut self.cap_buf;
+                self.backdrop = capture_screen(rect.left, rect.top, W, H, cap).and_then(|()| {
+                    let info = skia_safe::ImageInfo::new(
+                        (W, H),
+                        skia_safe::ColorType::BGRA8888,
+                        skia_safe::AlphaType::Premul,
+                        None,
+                    );
+                    skia_safe::images::raster_from_data(
+                        &info,
+                        Data::new_copy(cap),
+                        (W * 4) as usize,
+                    )
+                });
+            }
+        }
+        let ms_cap = t_cap.elapsed().as_secs_f32() * 1000.0;
 
         // 2) 渲染一帧（复用 surface，不每帧重新分配）
+        let t_rnd = Instant::now();
         let surface = self
             .surface
             .get_or_insert_with(|| surfaces::raster_n32_premul((W, H)).expect("surface"));
@@ -741,12 +851,13 @@ impl App {
             surface,
             effect,
             t,
-            backdrop_img.as_ref(),
+            self.backdrop.as_ref(),
             angle,
             self.blob_pos,
             self.blob_r,
             glass_only,
         );
+        let ms_rnd = t_rnd.elapsed().as_secs_f32() * 1000.0;
 
         // 用 read_pixels 取出来（peek_pixels 在这个版本拿不到数据）
         let info = skia_safe::ImageInfo::new(
@@ -759,11 +870,15 @@ impl App {
         if self.buf.len() != (W * H * 4) as usize {
             self.buf = vec![0u8; (W * H * 4) as usize];
         }
+        let t_read = Instant::now();
         let ok = surface.read_pixels(&info, &mut self.buf, (W * 4) as usize, (0, 0));
+        let ms_read = t_read.elapsed().as_secs_f32() * 1000.0;
 
+        let t_blit = Instant::now();
         if ok {
             dib.blit(self.hwnd, &self.buf);
         }
+        let ms_blit = t_blit.elapsed().as_secs_f32() * 1000.0;
 
         // 调试：跑够若干帧后把渲染结果存盘（绕过截屏，看到的就是真实渲染）
         if let Some(path) = &self.dump_path {
@@ -785,6 +900,14 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+
+        // 分段计时：帧间隔 vs 我们真正花掉的 CPU 时间
+        // （差值就是 DWM 合成/等待的时间）
+        self.busy_ms += t_frame.elapsed().as_secs_f32() * 1000.0;
+        self.ms_cap += ms_cap;
+        self.ms_rnd += ms_rnd;
+        self.ms_read += ms_read;
+        self.ms_blit += ms_blit;
     }
 }
 
