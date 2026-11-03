@@ -89,7 +89,14 @@ float smin(float a, float b, float k) {
 // 快速移动光标时会拉出一条液态拖尾，多个圆跟主体平滑融合。
 float sceneD(float2 p) {
     float d = sdRoundRect(p, rectSize * 0.5, corner);
-    d = smin(d, length(p - blob0Pos) - blob0R, 30.0);
+    // 三个小圆通常一个都没激活：先做一次总判断直接返回，
+    // 省掉每像素三次分支（sceneD 每像素会被调用 1~3 次）
+    if (blob0R + blob1R + blob2R < 0.5) {
+        return d;
+    }
+    if (blob0R > 0.5) {
+        d = smin(d, length(p - blob0Pos) - blob0R, 30.0);
+    }
     if (blob1R > 0.5) {
         d = smin(d, length(p - blob1Pos) - blob1R, 24.0);
     }
@@ -617,6 +624,8 @@ struct App {
     backdrop: Option<skia_safe::Image>,
     /// 帧计数（判断要不要重新抓屏）
     frame_no: u32,
+    /// 上次抓屏时窗口的位置（窗口一动就强制重抓）
+    last_cap_pos: (i32, i32),
     /// FPS 统计（debug 用）
     fps_n: u32,
     fps_t: Instant,
@@ -652,6 +661,7 @@ impl App {
             cap_buf: Vec::new(),
             backdrop: None,
             frame_no: 0,
+            last_cap_pos: (i32::MIN, i32::MIN),
             fps_n: 0,
             fps_t: Instant::now(),
             busy_ms: 0.0,
@@ -743,19 +753,21 @@ impl App {
     /// 快速移动光标时会拉出一条液态拖尾，全都跟主体平滑融合。
     fn update_blob(&mut self, dt: f32) {
         // 调试覆盖：--blob 直接指定融合小圆，不受真实鼠标影响
+        // （注意：只跳过小圆计算，后面的调试统计照样要跑）
         if let Some(bs) = self.blob_override {
             self.blobs = bs;
-            return;
-        }
+        } else {
         let (cx, cy) = self.cursor_local();
 
         // 记轨迹：光标移动超过 6px 就往前挪一格（形成滞后）
+        // ⚠️ 顺序很重要：必须先把旧值往后挪，再写新的 trail[0]，
+        //    否则 trail[1] 存的永远是当前位置，拖尾就消失了。（复查发现过的 bug）
         let moved = ((cx - self.trail[0].0).powi(2) + (cy - self.trail[0].1).powi(2)).sqrt();
-        self.trail[0] = (cx, cy);
         if moved > 6.0 {
             self.trail[2] = self.trail[1];
             self.trail[1] = self.trail[0];
         }
+        self.trail[0] = (cx, cy);
 
         let half_w = 210.0f32;
         let half_h = 120.0f32;
@@ -805,6 +817,7 @@ impl App {
                 b.2 = 0.0;
             }
         }
+        } // 小圆计算结束（--blob 覆盖时会跳过这一段）
 
         // 调试日志只在 debug 构建里打，release 版本保持安静
         self.dbg_n += 1;
@@ -872,8 +885,13 @@ impl App {
             // 所以隔一帧抓一次，中间那帧复用上一张背景 —— 玻璃折射会晚一帧，
             // 但帧率能翻倍，肉眼看不出差别。
             self.frame_no += 1;
-            let need_capture = self.backdrop.is_none() || self.frame_no % 2 == 0;
+            // 窗口被拖动时必须重新抓屏，否则缓存里是旧位置的桌面（会看到错位的背景）
+            let pos_changed = self.last_cap_pos != (rect.left, rect.top);
+            let need_capture = self.backdrop.is_none()
+                || pos_changed
+                || self.frame_no % 2 == 0;
             if need_capture {
+                self.last_cap_pos = (rect.left, rect.top);
                 // 抓屏缓冲复用，避免每帧重新分配 1MB
                 let cap = &mut self.cap_buf;
                 self.backdrop = capture_screen(rect.left, rect.top, W, H, cap).and_then(|()| {
