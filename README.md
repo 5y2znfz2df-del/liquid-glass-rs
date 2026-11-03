@@ -19,6 +19,7 @@ Windows 上的**真·液态玻璃**渲染实验：Skia + SkSL 运行时着色器
 | 无边框透明置顶窗口 | ✅ 通过 |
 | 抓真实桌面当背景 | ✅ 通过 |
 | **跟手高光** | ✅ 光标方向决定光照方位 |
+| **液态融合形变** | ✅ 光标靠近边缘，玻璃鼓起一个包（smin 平滑并集） |
 | **点击穿透** | ✅ 按 `T` 切换 |
 | **拖拽移动 + 位置记忆** | ✅ 下次启动回到原位 |
 | 性能 | ✅ 复用 surface 和像素缓冲（不再每帧分配） |
@@ -50,7 +51,28 @@ Windows 上的**真·液态玻璃**渲染实验：Skia + SkSL 运行时着色器
 | 无 | 开窗口 |
 | `--offscreen` | 只渲一张 PNG（测试图案背景） |
 | `--dump-frame <路径>` | 跑 60 帧后把渲染结果存盘退出 |
+| `--glass-only` | 只画玻璃不画背景，PNG 的 alpha 就是玻璃轮廓 |
+| `--blob x,y,r` | 强制指定融合小圆（不受真实鼠标干扰，方便自动化验证） |
 | `--no-exclude` | 不设 `WDA_EXCLUDEFROMCAPTURE`（调试用，见下方警告） |
+
+### 怎么量化验证效果
+
+`tools/` 下有两个脚本：
+
+```powershell
+python tools/measure_refraction.py liquid-glass-out.png
+```
+
+在测试图案（横线+竖线网格）上量竖线的位移：
+玻璃中心位移 ≈ 0，玻璃边缘位移 ≈ 8~18 px —— 这就是折射的量。
+
+```powershell
+# 融合形变：看玻璃轮廓有没有被撑开
+cargo run -- --glass-only --blob 0,0,0     --dump-frame shape-none.png
+cargo run -- --glass-only --blob 210,0,46  --dump-frame shape-bulge.png
+```
+
+两个 PNG 的包围盒对比，能看出小圆把轮廓撑出去多少。
 
 ### ⚠️ 怎么截到自己的窗口
 

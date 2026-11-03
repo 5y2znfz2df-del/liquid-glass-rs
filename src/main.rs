@@ -16,7 +16,7 @@
 #![windows_subsystem = "windows"]
 
 use skia_safe::{
-    surfaces, Color, Data, EncodedImageFormat, Paint, PaintStyle, Rect, RRect, RuntimeEffect,
+    surfaces, Color, Data, EncodedImageFormat, Paint, PaintStyle, Rect, RuntimeEffect,
     SamplingOptions, Surface, TileMode,
 };
 use std::ffi::c_void;
@@ -60,28 +60,51 @@ uniform float  dispersion;
 uniform float  lightAngle;
 uniform float  tintAmount;
 uniform float  pad0;
+uniform float2 blobPos;
+uniform float  blobR;
+uniform float  pad1;
 uniform float4 tintColor;
 
-float sdRoundRect(float2 p, float2 halfSize, float r, out float2 g) {
-    float2 sgn = float2(p.x < 0.0 ? -1.0 : 1.0, p.y < 0.0 ? -1.0 : 1.0);
+// 圆角矩形的有符号距离场
+float sdRoundRect(float2 p, float2 halfSize, float r) {
     float2 q = abs(p) - halfSize + r;
-    if (q.x > 0.0 && q.y > 0.0) {
-        float2 m = q / r;
-        float len = length(m);
-        g = (m / max(len, 0.0001)) * sgn;
-        return (len - 1.0) * r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+// 平滑并集：让两块玻璃"融"在一起，而不是硬边拼接
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// 整个玻璃的形状 = 主体矩形 ∪ 跟手小圆
+float sceneD(float2 p) {
+    float d = sdRoundRect(p, rectSize * 0.5, corner);
+    if (blobR > 0.5) {
+        d = smin(d, length(p - blobPos) - blobR, 30.0);
     }
-    g = q.x > q.y ? float2(sgn.x, 0.0) : float2(0.0, sgn.y);
-    return max(q.x, q.y) - r;
+    return d;
 }
 
 half4 main(float2 coord) {
-    float2 halfSize = rectSize * 0.5;
     float2 local = coord - center;
 
-    float2 g;
-    float d = sdRoundRect(local, halfSize, corner, g);
+    float d = sceneD(local);
     if (d > 0.0) { return half4(0.0); }
+
+    // 形状可能是两个图形融出来的，没有解析梯度，用中心差分求法线
+    float e = 1.0;
+    float2 grad = float2(
+        sceneD(local + float2(e, 0.0)) - sceneD(local - float2(e, 0.0)),
+        sceneD(local + float2(0.0, e)) - sceneD(local - float2(0.0, e))
+    );
+    float glen = length(grad);
+    // 中轴线上梯度会退化，这时退回矩形的解析方向
+    float2 gRect = normalize(float2(
+        local.x / max(rectSize.x * 0.5, 1.0),
+        local.y / max(rectSize.y * 0.5, 1.0)
+    ) + float2(1e-5, 1e-5));
+    float2 g = glen > 0.002 ? grad / glen : gRect;
 
     float inward = -d;
     float band = clamp(inward / max(bezel, 0.001), 0.0, 1.0);
@@ -117,7 +140,9 @@ half4 main(float2 coord) {
     float spec = pow(max(dot(g, L), 0.0), 6.0) * band * band;
     glass += spec * 0.85;
 
-    float rim = 1.0 - smoothstep(0.0, 1.6, inward);
+    // 边缘：先压一道暗边（白底上才看得见轮廓），再叠高光
+    float rim = 1.0 - smoothstep(0.0, 1.8, inward);
+    glass *= 1.0 - rim * 0.22;
     glass += rim * 0.25;
 
     float alpha = 1.0 - smoothstep(-1.0, 0.0, d);
@@ -195,6 +220,10 @@ fn draw_frame(
     t: f32,
     backdrop: Option<&skia_safe::Image>,
     light_angle: f32,
+    blob_pos: (f32, f32),
+    blob_r: f32,
+    // 只画玻璃不画背景（调试：PNG 的 alpha 就是玻璃轮廓，方便量化验证）
+    glass_only: bool,
 ) {
     // ---- 背景 ----
     // 有真实抓屏就用它；没有就画测试图案（离屏调试用）。
@@ -205,6 +234,8 @@ fn draw_frame(
         if let Some(img) = backdrop {
             // 直接把桌面截图铺满，作为玻璃的"背景"
             canvas.draw_image(img, (0, 0), None);
+        } else if glass_only {
+            // 只要玻璃的形状，背景留透明
         } else {
             let colors = [
                 Color::from_rgb(255, 59, 107),
@@ -236,6 +267,12 @@ fn draw_frame(
                 canvas.draw_line((0.0, y), (W as f32, y), &line);
                 y += 22.0;
             }
+            // 竖线：折射位移是水平方向的，竖线被掰弯才量得出来
+            let mut x = offset - 22.0;
+            while x < W as f32 {
+                canvas.draw_line((x, 0.0), (x, H as f32), &line);
+                x += 22.0;
+            }
         }
     } // 借用在这里结束，下面才能 snapshot
 
@@ -251,20 +288,26 @@ fn draw_frame(
 
     let rect_w = 420.0f32;
     let rect_h = 240.0f32;
-    let uniform: [f32; 16] = [
+    // 布局必须和 SkSL 里的 uniform 声明一一对应（含 16 字节对齐的 float4）
+    // 0 rectSize | 2 center | 4..11 标量 | 12 blobPos | 14 blobR | 16 tintColor
+    let uniform: [f32; 20] = [
         rect_w,
         rect_h,
         W as f32 / 2.0,
         H as f32 / 2.0,
-        52.0,        // corner
-        38.0,        // bezel：边缘折射带
-        34.0,        // thickness：玻璃厚度
-        1.42,        // ior
-        0.05,        // dispersion
-        light_angle, // 跟手：光源方向 = 光标相对玻璃中心的方位角
-        0.10,        // tintAmount
-        0.0,
-        0.90,
+        52.0,           // corner
+        38.0,           // bezel：边缘折射带
+        34.0,           // thickness：玻璃厚度
+        1.42,           // ior
+        0.05,           // dispersion
+        light_angle,    // 跟手：光源方向 = 光标相对玻璃中心的方位角
+        0.10,           // tintAmount
+        0.0,            // pad0（对齐用）
+        blob_pos.0,     // blobPos：跟手小圆的位置（相对玻璃中心）
+        blob_pos.1,
+        blob_r,         // blobR：小圆半径，0 = 不融合
+        0.0,            // pad1
+        0.90,           // tintColor
         0.92,
         0.95,
         1.0,
@@ -277,23 +320,18 @@ fn draw_frame(
         let mut paint = Paint::default();
         paint.set_shader(shader);
         paint.set_anti_alias(true);
+        // 绘制区域要比玻璃本体大一圈：融合出的小圆可能在矩形之外，
+        // 区域外的像素由着色器返回透明，不会有硬边。
+        let pad = 70.0f32;
         let rect = Rect::from_xywh(
-            (W as f32 - rect_w) / 2.0,
-            (H as f32 - rect_h) / 2.0,
-            rect_w,
-            rect_h,
+            (W as f32 - rect_w) / 2.0 - pad,
+            (H as f32 - rect_h) / 2.0 - pad,
+            rect_w + pad * 2.0,
+            rect_h + pad * 2.0,
         );
         // 重新借一次 canvas 画玻璃
         let canvas = surface.canvas();
-        canvas.draw_rrect(RRect::new_rect_xy(rect, 52.0, 52.0), &paint);
-
-        // 描边：让玻璃边界在白底上也看得见
-        let mut edge = Paint::default();
-        edge.set_style(PaintStyle::Stroke);
-        edge.set_stroke_width(1.2);
-        edge.set_anti_alias(true);
-        edge.set_color(Color::from_argb(70, 255, 255, 255));
-        canvas.draw_rrect(RRect::new_rect_xy(rect, 52.0, 52.0), &edge);
+        canvas.draw_rect(rect, &paint);
     } else {
         static ONCE2: std::sync::Once = std::sync::Once::new();
         ONCE2.call_once(|| eprintln!("[错误] make_shader 返回 None，uniform {} 字节", bytes.len()));
@@ -492,6 +530,17 @@ struct App {
     /// 调试：把渲染帧存到这个路径，然后退出
     dump_path: Option<String>,
     frames: u32,
+    /// 跟手小圆（液态融合）：当前半径和位置，插值出来的所以有"甩"的惯性
+    blob_r: f32,
+    blob_pos: (f32, f32),
+    /// 上一帧的时间，用来算 dt（让插值和帧率无关）
+    last_frame: Instant,
+    /// 只画玻璃不画背景（调试）
+    glass_only: bool,
+    /// 调试计数器
+    dbg_n: u32,
+    /// 调试：强制指定融合小圆的位置和半径（不受鼠标影响）
+    blob_override: Option<(f32, f32, f32)>,
 }
 
 impl App {
@@ -509,6 +558,12 @@ impl App {
             prev_t: false,
             dump_path: None,
             frames: 0,
+            blob_r: 0.0,
+            blob_pos: (0.0, 0.0),
+            last_frame: Instant::now(),
+            glass_only: false,
+            dbg_n: 0,
+            blob_override: None,
         }
     }
 
@@ -549,7 +604,19 @@ impl App {
     }
 
     /// 光标相对玻璃中心的方位角（弧度），用于跟手高光
-    fn light_angle(&self) -> f32 {
+    /// 光标相对玻璃中心的位置（surface 像素坐标，y 向下）
+    fn cursor_local(&self) -> (f32, f32) {
+        let (pt, rect) = self.cursor_and_rect();
+        let cx = pt.x - rect.left;
+        let cy = pt.y - rect.top;
+        (
+            cx as f32 - W as f32 / 2.0,
+            cy as f32 - H as f32 / 2.0,
+        )
+    }
+
+    /// 原始的光标屏幕坐标和窗口矩形（调试用）
+    fn cursor_and_rect(&self) -> (POINT, windows::Win32::Foundation::RECT) {
         let mut pt = POINT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
@@ -558,14 +625,87 @@ impl App {
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rect);
         }
-        let cx = pt.x - rect.left;
-        let cy = pt.y - rect.top;
-        let dx = cx as f32 - W as f32 / 2.0;
-        let dy = cy as f32 - H as f32 / 2.0;
+        (pt, rect)
+    }
+
+    fn light_angle(&self) -> f32 {
+        let (dx, dy) = self.cursor_local();
         dy.atan2(dx)
     }
 
+    /// 跟手小圆：光标靠近玻璃边缘时，玻璃朝光标鼓起一个包。
+    ///
+    /// 位置和半径都做插值，所以快速移动光标时会有液态的甩尾。
+    fn update_blob(&mut self, dt: f32) {
+        // 调试覆盖：--blob x,y,r 直接指定融合小圆，不受真实鼠标影响
+        if let Some((x, y, r)) = self.blob_override {
+            self.blob_pos = (x, y);
+            self.blob_r = r;
+            return;
+        }
+        let (cx, cy) = self.cursor_local();
+        let half_w = 210.0f32;
+        let half_h = 120.0f32;
+        let len = (cx * cx + cy * cy).sqrt();
+
+        let mut bx = 0.0f32;
+        let mut by = 0.0f32;
+        let mut target = 0.0f32;
+
+        if len > 1.0 {
+            let dir_x = cx / len;
+            let dir_y = cy / len;
+            // 从中心沿光标方向射到矩形边界
+            let tx = if dir_x.abs() > 1e-4 {
+                half_w / dir_x.abs()
+            } else {
+                f32::MAX
+            };
+            let ty = if dir_y.abs() > 1e-4 {
+                half_h / dir_y.abs()
+            } else {
+                f32::MAX
+            };
+            let t = tx.min(ty);
+            bx = dir_x * t;
+            by = dir_y * t;
+
+            let outside = len - t; // >0 表示光标在玻璃外面
+            let dist = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt();
+            if outside > -6.0 {
+                // 越贴近边缘包越大，离远了就收回去
+                target = 46.0 * (1.0 - (dist - 10.0) / 120.0).clamp(0.0, 1.0);
+            }
+        }
+
+        let k = (dt * 9.0).min(1.0);
+        self.blob_r += (target - self.blob_r) * k;
+        self.blob_pos.0 += (bx - self.blob_pos.0) * k;
+        self.blob_pos.1 += (by - self.blob_pos.1) * k;
+        if self.blob_r < 0.4 {
+            self.blob_r = 0.0;
+        }
+
+        // 调试日志只在 debug 构建里打，release 版本保持安静
+        self.dbg_n += 1;
+        if cfg!(debug_assertions) && self.dbg_n % 20 == 1 {
+            let (pt, rect) = self.cursor_and_rect();
+            eprintln!(
+                "[blob] 光标=({},{}) 窗口=({},{}) 局部=({:.0},{:.0}) 目标r={:.1} 当前r={:.1} 位置=({:.0},{:.0})",
+                pt.x, pt.y, rect.left, rect.top, cx, cy,
+                target, self.blob_r, self.blob_pos.0, self.blob_pos.1
+            );
+        }
+    }
+
     fn draw(&mut self) {
+        // 跟手小圆：按 dt 插值，帧率无关
+        // （必须放在下面的不可变借用之前，否则 self 借出冲突）
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
+        self.last_frame = now;
+        self.update_blob(dt);
+
         let (Some(_window), Some(effect), Some(dib)) = (&self.window, &self.effect, &self.dib) else {
             return;
         };
@@ -577,21 +717,36 @@ impl App {
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rect);
         }
-        let backdrop_img = capture_screen(rect.left, rect.top, W, H).and_then(|pixels| {
-            let info = skia_safe::ImageInfo::new(
-                (W, H),
-                skia_safe::ColorType::BGRA8888,
-                skia_safe::AlphaType::Premul,
-                None,
-            );
-            skia_safe::images::raster_from_data(&info, Data::new_copy(&pixels), (W * 4) as usize)
-        });
+        // --glass-only：跳过抓屏，PNG 的 alpha 就是玻璃轮廓
+        let glass_only = self.glass_only;
+        let backdrop_img = if glass_only {
+            None
+        } else {
+            capture_screen(rect.left, rect.top, W, H).and_then(|pixels| {
+                let info = skia_safe::ImageInfo::new(
+                    (W, H),
+                    skia_safe::ColorType::BGRA8888,
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                skia_safe::images::raster_from_data(&info, Data::new_copy(&pixels), (W * 4) as usize)
+            })
+        };
 
         // 2) 渲染一帧（复用 surface，不每帧重新分配）
         let surface = self
             .surface
             .get_or_insert_with(|| surfaces::raster_n32_premul((W, H)).expect("surface"));
-        draw_frame(surface, effect, t, backdrop_img.as_ref(), angle);
+        draw_frame(
+            surface,
+            effect,
+            t,
+            backdrop_img.as_ref(),
+            angle,
+            self.blob_pos,
+            self.blob_r,
+            glass_only,
+        );
 
         // 用 read_pixels 取出来（peek_pixels 在这个版本拿不到数据）
         let info = skia_safe::ImageInfo::new(
@@ -756,7 +911,7 @@ fn render_offscreen() {
     let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL, None)
         .unwrap_or_else(|e| panic!("SkSL 编译失败: {e}"));
     let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
-    draw_frame(&mut surface, &effect, 0.0, None, 2.2);
+    draw_frame(&mut surface, &effect, 0.0, None, 2.2, (0.0, 0.0), 0.0, false);
 
     let image = surface.image_snapshot();
     let data = image
@@ -783,6 +938,22 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--dump-frame") {
         if let Some(p) = args.get(i + 1) {
             app.dump_path = Some(p.clone());
+        }
+    }
+    // 调试：--glass-only 只画玻璃不画背景（PNG 的 alpha 就是玻璃轮廓）
+    if args.iter().any(|a| a == "--glass-only") {
+        app.glass_only = true;
+    }
+    // 调试：--blob x,y,r 强制指定融合小圆（不受真实鼠标干扰，方便自动化验证）
+    if let Some(i) = args.iter().position(|a| a == "--blob") {
+        if let Some(v) = args.get(i + 1) {
+            let nums: Vec<f32> = v
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .collect();
+            if nums.len() == 3 {
+                app.blob_override = Some((nums[0], nums[1], nums[2]));
+            }
         }
     }
 
