@@ -152,11 +152,45 @@ SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
 代价：BitBlt 抓不到硬件加速的内容（视频播放器、游戏画面可能全黑）。
 要支持那些得换 Windows.Graphics.Capture。
 
+### 液态融合是怎么做的
+
+形状不是画出来的，是**距离场（SDF）算出来的**：
+
+```glsl
+float sdRoundRect(float2 p, float2 halfSize, float r) { ... }  // 圆角矩形
+float smin(float a, float b, float k) { ... }                   // 平滑并集
+float sceneD(float2 p) {                                        // 整体形状
+    float d = sdRoundRect(p, rectSize * 0.5, corner);
+    if (blobR > 0.5) { d = smin(d, length(p - blobPos) - blobR, 30.0); }
+    return d;
+}
+```
+
+`blobPos` / `blobR` 是跟手小圆的位置和半径，Rust 侧按光标位置算，
+每帧用 `dt` 插值（所以快速移动光标有液态的甩尾）。
+
+**法线用中心差分求**，因为融合后的形状没有解析梯度：
+
+```glsl
+float2 grad = float2(
+    sceneD(local + float2(e, 0.0)) - sceneD(local - float2(e, 0.0)),
+    sceneD(local + float2(0.0, e)) - sceneD(local - float2(0.0, e))
+);
+```
+
+⚠️ 有个坑：绘制区域必须比玻璃本体**大 70px**，否则融合出来的小圆会被
+绘制区域裁掉。区域外的像素着色器返回全透明，不会有硬边。
+
+⚠️ 还有一个坑：距离场在**中轴线**上梯度会退化（distance-to-boundary 的
+极小值线），那里 `normalize(0)` 会得到 NaN，整块玻璃会变透明。
+代码里判断了梯度长度，太小就退回矩形的解析方向。
+
 ### 下一步
 
-1. **跟手高光**：鼠标位置 → 调整 `lightAngle` uniform
-2. **点击穿透**：`WS_EX_TRANSPARENT`
-3. **性能优化**：现在每帧都新建 Skia surface + 抓屏，可以复用
+1. **多块玻璃**：现在是单个小圆，要真正的多块融合得把 SDF 改成数组循环
+2. **真正的形变动画**：形态变化（比如滑入的方形变圆形）需要两个 shape 的权重混合
+3. **高 DPI**：现在不处理缩放，150% 缩放下窗口偏小
+4. **硬件加速内容**：BitBlt 抓不到，得换 Windows.Graphics.Capture
 
 ## 许可证
 
