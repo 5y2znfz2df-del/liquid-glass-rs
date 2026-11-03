@@ -1,1 +1,5 @@
 /target
+
+# 运行时产物
+window-pos.txt
+liquid-glass-error.log

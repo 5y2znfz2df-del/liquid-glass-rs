@@ -32,12 +32,12 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_T};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetWindowLongPtrW, GetWindowRect, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    UpdateLayeredWindow, GWL_EXSTYLE, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    SetWindowPos, UpdateLayeredWindow, GWL_EXSTYLE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId, WindowLevel};
@@ -413,6 +413,66 @@ impl Drop for Dib {
     }
 }
 
+// ------------------------------------------------------------ 位置记忆 --
+/// 配置文件放在 exe 同级目录（绿色软件，卸载时删目录即可）
+fn pos_file() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("window-pos.txt")))
+        .unwrap_or_else(|| std::path::PathBuf::from("window-pos.txt"))
+}
+
+/// 崩溃日志（GUI 子系统没有控制台，panic 不写文件就彻底没线索）
+fn log_file() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("liquid-glass-error.log")))
+        .unwrap_or_else(|| std::path::PathBuf::from("liquid-glass-error.log"))
+}
+
+/// 装一个 panic 钩子：把崩溃信息写到 exe 同级目录
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!(
+            "[{}] PANIC: {info}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        );
+        let _ = fs::write(log_file(), msg);
+    }));
+}
+
+fn load_pos() -> Option<(i32, i32)> {
+    let text = fs::read_to_string(pos_file()).ok()?;
+    let mut parts = text.trim().split(',');
+    let x: i32 = parts.next()?.trim().parse().ok()?;
+    let y: i32 = parts.next()?.trim().parse().ok()?;
+    // 简单合法性检查：别恢复到屏幕外面去
+    if x.abs() > 10000 || y.abs() > 10000 {
+        return None;
+    }
+    Some((x, y))
+}
+
+fn save_pos(hwnd: HWND) {    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_ok() {
+            let _ = fs::write(pos_file(), format!("{},{}", rect.left, rect.top));
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        save_pos(self.hwnd);
+    }
+}
+
 // ------------------------------------------------------------- 窗口应用 --
 struct App {
     window: Option<std::sync::Arc<Window>>,
@@ -561,6 +621,8 @@ impl App {
                         println!("已保存渲染帧 -> {path}");
                     }
                 }
+                // process::exit 不会跑 Drop，所以这里手动存一次位置
+                save_pos(self.hwnd);
                 std::process::exit(0);
             }
         }
@@ -627,6 +689,14 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.start = Instant::now();
 
+        // 恢复上次的位置（首次运行就用默认位置）
+        if let Some((x, y)) = load_pos() {
+            unsafe {
+                let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            println!("已恢复位置 ({x}, {y})");
+        }
+
         println!("窗口已创建  hwnd={:?}", hwnd);
     }
 
@@ -639,6 +709,24 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.draw(),
+            // 左键按下 → 拖动窗口（winit 的系统级拖动，比手动 SetWindowPos 顺滑）
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => match button {
+                MouseButton::Left => {
+                    // 穿透状态下不该能拖动（鼠标事件本来就到不了窗口，这里加个保险）
+                    if !self.click_through {
+                        if let Some(w) = &self.window {
+                            let _ = w.drag_window();
+                        }
+                    }
+                }
+                // 右键 = 退出（无边框窗口给个退路）
+                MouseButton::Right => event_loop.exit(),
+                _ => {}
+            },
             WindowEvent::KeyboardInput { event, .. } => {
                 // 按 ESC 退出，免得无边框窗口关不掉
                 if event.logical_key
@@ -680,6 +768,8 @@ fn render_offscreen() {
 }
 
 fn main() {
+    install_panic_hook();
+
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--offscreen") {
         render_offscreen();
