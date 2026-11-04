@@ -48,8 +48,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId, WindowLevel};
 
 /// 窗口尺寸
-const W: i32 = 620;
-const H: i32 = 420;
+const W: i32 = 428;
+const H: i32 = 248;
 /// 抓屏时窗口四周多抓多少像素。窗口在这么多像素内移动都不用重抓，
 /// 只靠 backdropOffset 平移就能保证画面跟窗口对齐（拖动不割裂、不掉帧）。
 const CAP_MARGIN: i32 = 120;
@@ -68,15 +68,6 @@ uniform float  dispersion;
 uniform float  lightAngle;
 uniform float  tintAmount;
 uniform float  pad0;
-uniform float2 blob0Pos;
-uniform float  blob0R;
-uniform float  pad1;
-uniform float2 blob1Pos;
-uniform float  blob1R;
-uniform float  pad2;
-uniform float2 blob2Pos;
-uniform float  blob2R;
-uniform float  pad3;
 uniform float4 tintColor;
 uniform float4 tintColor2;
 uniform float2 backdropOffset;
@@ -87,33 +78,9 @@ float sdRoundRect(float2 p, float2 halfSize, float r) {
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
 
-// 平滑并集：让两块玻璃"融"在一起，而不是硬边拼接
-float smin(float a, float b, float k) {
-    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-    return mix(b, a, h) - k * h * (1.0 - h);
-}
-
-// 整个玻璃的形状 = 主体矩形 ∪ 若干跟手小圆
-//
-// 三个小圆 = 光标当前位置 + 前两个历史位置（半径递减），
-// 快速移动光标时会拉出一条液态拖尾，多个圆跟主体平滑融合。
+// 整个玻璃的形状 = 一个圆角矩形
 float sceneD(float2 p) {
-    float d = sdRoundRect(p, rectSize * 0.5, corner);
-    // 三个小圆通常一个都没激活：先做一次总判断直接返回，
-    // 省掉每像素三次分支（sceneD 每像素会被调用 1~3 次）
-    if (blob0R + blob1R + blob2R < 0.5) {
-        return d;
-    }
-    if (blob0R > 0.5) {
-        d = smin(d, length(p - blob0Pos) - blob0R, 30.0);
-    }
-    if (blob1R > 0.5) {
-        d = smin(d, length(p - blob1Pos) - blob1R, 24.0);
-    }
-    if (blob2R > 0.5) {
-        d = smin(d, length(p - blob2Pos) - blob2R, 18.0);
-    }
-    return d;
+    return sdRoundRect(p, rectSize * 0.5, corner);
 }
 
 half4 main(float2 coord) {
@@ -179,8 +146,15 @@ half4 main(float2 coord) {
     float4 tint = mix(tintColor, tintColor2, gy);
     glass = mix(glass, tint.rgb, tintAmount);
 
+    // 高光是"玻璃边缘被掰弯的那一圈"反射出来的，只能出现在边缘带。
+    // edge: 边缘处 1，往里走迅速衰减到 0。
+    //
+    // ⚠️ 这里原来写的是 `* band * band`，而 band 在玻璃内部恒等于 1 ——
+    // 等于内部高光完全没衰减。光标在玻璃下方时光线方向正好对上内部占位法线
+    // (0,1)，整个内部就被灌满白光（整窗变白）。改成按"离边缘多远"衰减。
     float2 L = float2(cos(lightAngle), sin(lightAngle));
-    float spec = pow(max(dot(g, L), 0.0), 6.0) * band * band;
+    float edge = 1.0 - band;
+    float spec = pow(max(dot(g, L), 0.0), 6.0) * edge * edge;
     glass += spec * 0.85;
 
     // 边缘：先压一道暗边（白底上才看得见轮廓），再叠高光
@@ -398,8 +372,6 @@ fn draw_frame(
     t: f32,
     backdrop: Option<&skia_safe::Image>,
     light_angle: f32,
-    // 三个跟手小圆：(x, y, 半径)，都相对玻璃中心
-    blobs: [(f32, f32, f32); 3],
     // 番茄钟状态（画在玻璃上面）
     pomo: &timer::Pomodoro,
     overlay: Option<&Overlay>,
@@ -470,36 +442,31 @@ fn draw_frame(
         )
         .expect("to_shader");
 
+    // ⚠️ 关键：快照拿到之后再清空画布。
+    // 抓来的桌面只能当"着色器的输入"，不能留在画布上 ——
+    // 否则玻璃外面会露出一整块**没经过折射**的旧桌面
+    // （看起来就是一块错位的图，也就是"边框外不正确"）。
+    // image_snapshot 是不可变快照，之后 clear 会触发 copy-on-write，快照仍然有效。
+    surface.canvas().clear(Color::TRANSPARENT);
+
     let rect_w = 420.0f32;
     let rect_h = 240.0f32;
     // 布局必须和 SkSL 里的 uniform 声明一一对应（含 16 字节对齐的 float4）
-    // 0 rectSize | 2 center | 4..11 标量 | 12..15 blob0 | 16..19 blob1 | 20..23 blob2
-    // | 24 tintColor | 28 tintColor2 | 32 backdropOffset（共 34 个 float = 136 字节）
-    let uniform: [f32; 34] = [
+    // 0 rectSize | 2 center | 4..11 标量 | 12 tintColor | 16 tintColor2 | 20 backdropOffset
+    // （共 22 个 float = 88 字节）
+    let uniform: [f32; 22] = [
         rect_w,
         rect_h,
         W as f32 / 2.0,
         H as f32 / 2.0,
-        52.0,           // corner
-        38.0,           // bezel：边缘折射带
+        46.0,           // corner
+        26.0,           // bezel：边缘折射带（调窄了，边框更细）
         34.0,           // thickness：玻璃厚度
         1.42,           // ior
         0.05,           // dispersion
         light_angle,    // 跟手：光源方向 = 光标相对玻璃中心的方位角
         0.70,           // tintAmount：黑玻璃，染得重才能压成黑色
         0.0,            // pad0（对齐用）
-        blobs[0].0,     // blob0Pos：跟手小圆的位置（相对玻璃中心）
-        blobs[0].1,
-        blobs[0].2,     // blob0R：半径，0 = 不融合
-        0.0,            // pad1
-        blobs[1].0,     // blob1Pos：拖尾第二个
-        blobs[1].1,
-        blobs[1].2,     // blob1R
-        0.0,            // pad2
-        blobs[2].0,     // blob2Pos：拖尾第三个
-        blobs[2].1,
-        blobs[2].2,     // blob2R
-        0.0,            // pad3
         // tintColor：渐变上端，近黑
         0.020,
         0.022,
@@ -540,10 +507,12 @@ fn draw_frame(
         });
         let mut paint = Paint::default();
         paint.set_shader(shader);
-        paint.set_anti_alias(true);
-        // 绘制区域要比玻璃本体大一圈：融合出的小圆可能在矩形之外，
-        // 区域外的像素由着色器返回透明，不会有硬边。
-        let pad = 70.0f32;
+        // 边缘是着色器自己算的平滑 alpha，不需要几何抗锯齿；
+        // 而且只能画玻璃本体这一块（外面一律透明），否则会盖住不该盖的地方。
+        paint.set_anti_alias(false);
+        // pad 只留 2px 给边缘那 1.8px 的轮廓过渡，别再往外扩了 ——
+        // 扩多少就多画多少像素，这是每帧渲染时间的直接来源。
+        let pad = 2.0f32;
         let rect = Rect::from_xywh(
             (W as f32 - rect_w) / 2.0 - pad,
             (H as f32 - rect_h) / 2.0 - pad,
@@ -770,20 +739,14 @@ struct App {
     dump_path: Option<String>,
     frames: u32,
     /// 跟手小圆（液态融合）：当前半径和位置，插值出来的所以有"甩"的惯性
-    /// 三个跟手小圆：(x, y, 半径)，相对玻璃中心
-    blobs: [(f32, f32, f32); 3],
-    /// 光标轨迹（最近 3 个位置），用来做液态拖尾
-    trail: [(f32, f32); 3],
     /// 上一帧的时间，用来算 dt（让插值和帧率无关）
     last_frame: Instant,
     /// 只画玻璃不画背景（调试）
     glass_only: bool,
     /// 调试计数器
-    dbg_n: u32,
     /// debug：上一帧打印过的 (抓屏原点, 是否重抓)，用来只在变化时打日志
     dbg_cap: ((i32, i32), bool),
     /// 调试：强制指定融合小圆的位置和半径（不受鼠标影响）
-    blob_override: Option<[(f32, f32, f32); 3]>,
     /// 抓屏缓冲，复用避免每帧分配
     cap_buf: Vec<u8>,
     /// 缓存的背景图（隔帧刷新）
@@ -829,13 +792,9 @@ impl App {
             overlay: Overlay::load(),
             dump_path: None,
             frames: 0,
-            blobs: [(0.0, 0.0, 0.0); 3],
-            trail: [(0.0, 0.0); 3],
             last_frame: Instant::now(),
             glass_only: false,
-            dbg_n: 0,
             dbg_cap: ((i32::MIN, i32::MIN), false),
-            blob_override: None,
             cap_buf: Vec::new(),
             backdrop: None,
             frame_no: 0,
@@ -970,91 +929,8 @@ impl App {
         dy.atan2(dx)
     }
 
-    /// 跟手小圆：光标靠近玻璃边缘时，玻璃朝光标鼓起一个包。
-    ///
-    /// 三个小圆 = 光标当前位置 + 两个历史位置（半径递减），
-    /// 快速移动光标时会拉出一条液态拖尾，全都跟主体平滑融合。
-    fn update_blob(&mut self, dt: f32) {
-        // 调试覆盖：--blob 直接指定融合小圆，不受真实鼠标影响
-        // （注意：只跳过小圆计算，后面的调试统计照样要跑）
-        if let Some(bs) = self.blob_override {
-            self.blobs = bs;
-        } else {
-        let (cx, cy) = self.cursor_local();
-
-        // 记轨迹：光标移动超过 6px 就往前挪一格（形成滞后）
-        // ⚠️ 顺序很重要：必须先把旧值往后挪，再写新的 trail[0]，
-        //    否则 trail[1] 存的永远是当前位置，拖尾就消失了。（复查发现过的 bug）
-        let moved = ((cx - self.trail[0].0).powi(2) + (cy - self.trail[0].1).powi(2)).sqrt();
-        if moved > 6.0 {
-            self.trail[2] = self.trail[1];
-            self.trail[1] = self.trail[0];
-        }
-        self.trail[0] = (cx, cy);
-
-        let half_w = 210.0f32;
-        let half_h = 120.0f32;
-        let k = (dt * 9.0).min(1.0);
-
-        // 每个小圆的基准半径：越靠后越小
-        const BASE_R: [f32; 3] = [46.0, 34.0, 24.0];
-
-        for i in 0..3 {
-            let (sx, sy) = self.trail[i];
-            let len = (sx * sx + sy * sy).sqrt();
-            let mut bx = 0.0f32;
-            let mut by = 0.0f32;
-            let mut target = 0.0f32;
-
-            if len > 1.0 {
-                let dir_x = sx / len;
-                let dir_y = sy / len;
-                // 从中心沿光标方向射到矩形边界
-                let tx = if dir_x.abs() > 1e-4 {
-                    half_w / dir_x.abs()
-                } else {
-                    f32::MAX
-                };
-                let ty = if dir_y.abs() > 1e-4 {
-                    half_h / dir_y.abs()
-                } else {
-                    f32::MAX
-                };
-                let t = tx.min(ty);
-                bx = dir_x * t;
-                by = dir_y * t;
-
-                let outside = len - t; // >0 表示光标在玻璃外面
-                let dist = ((sx - bx).powi(2) + (sy - by).powi(2)).sqrt();
-                if outside > -6.0 {
-                    // 越贴近边缘包越大，离远了就收回去
-                    target = BASE_R[i] * (1.0 - (dist - 10.0) / 120.0).clamp(0.0, 1.0);
-                }
-            }
-
-            let b = &mut self.blobs[i];
-            b.2 += (target - b.2) * k;
-            b.0 += (bx - b.0) * k;
-            b.1 += (by - b.1) * k;
-            if b.2 < 0.4 {
-                b.2 = 0.0;
-            }
-        }
-        } // 小圆计算结束（--blob 覆盖时会跳过这一段）
-
-        // 调试日志只在 debug 构建里打，release 版本保持安静
-        self.dbg_n += 1;
-        if cfg!(debug_assertions) && self.dbg_n % 20 == 1 {
-            let (pt, rect) = self.cursor_and_rect();
-            eprintln!(
-                "[blob] 光标=({},{}) 窗口=({},{}) 小圆 r=({:.0},{:.0},{:.0}) 位置=({:.0},{:.0})/({:.0},{:.0})/({:.0},{:.0})",
-                pt.x, pt.y, rect.left, rect.top,
-                self.blobs[0].2, self.blobs[1].2, self.blobs[2].2,
-                self.blobs[0].0, self.blobs[0].1,
-                self.blobs[1].0, self.blobs[1].1,
-                self.blobs[2].0, self.blobs[2].1
-            );
-        }
+    /// 每帧的统计（FPS / 分段耗时）。原来的跟手小圆（液态鼓包）已按需求移除。
+    fn update_stats(&mut self, _dt: f32) {
         self.fps_n += 1;
         if self.fps_n >= 60 {
             let el = self.fps_t.elapsed().as_secs_f32();
@@ -1086,7 +962,7 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
-        self.update_blob(dt);
+        self.update_stats(dt);
 
         // 番茄钟推进。阶段切完响一声（放后台线程，不然 Beep 会把这一帧卡住 200ms）
         self.pomo.tick(dt);
@@ -1228,7 +1104,6 @@ impl App {
             t,
             self.backdrop.as_ref(),
             angle,
-            self.blobs,
             &self.pomo,
             self.overlay.as_ref(),
             backdrop_offset,
@@ -1465,7 +1340,6 @@ fn render_offscreen() {
         0.0,
         None,
         2.2,
-        [(0.0, 0.0, 0.0); 3],
         &timer::Pomodoro::new(),
         Overlay::load().as_ref(),
         off,
@@ -1531,30 +1405,6 @@ fn main() {
                 app.pomo.remaining = timer::FOCUS_SECS;
             }
             _ => {}
-        }
-    }
-    // 调试：--blob x,y,r 强制指定融合小圆（不受真实鼠标干扰，方便自动化验证）
-    // 可以写多组，用分号隔开：--blob "10,20,30;100,50,24"
-    if let Some(i) = args.iter().position(|a| a == "--blob") {
-        if let Some(v) = args.get(i + 1) {
-            let mut blobs = [(0.0f32, 0.0f32, 0.0f32); 3];
-            let mut n = 0;
-            for group in v.split(';') {
-                if n >= 3 {
-                    break;
-                }
-                let nums: Vec<f32> = group
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<f32>().ok())
-                    .collect();
-                if nums.len() == 3 {
-                    blobs[n] = (nums[0], nums[1], nums[2]);
-                    n += 1;
-                }
-            }
-            if n > 0 {
-                app.blob_override = Some(blobs);
-            }
         }
     }
 
