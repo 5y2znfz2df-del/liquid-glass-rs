@@ -53,6 +53,10 @@ const H: i32 = 248;
 /// 抓屏时窗口四周多抓多少像素。窗口在这么多像素内移动都不用重抓，
 /// 只靠 backdropOffset 平移就能保证画面跟窗口对齐（拖动不割裂、不掉帧）。
 const CAP_MARGIN: i32 = 120;
+/// 鼠标离开多少秒后自动收起到屏幕边缘
+const EDGE_HIDE_SECS: f32 = 5.0;
+/// 收起后还露在外面的宽度（够鼠标碰到就行）
+const EDGE_PEEK: i32 = 10;
 
 // ---------------------------------------------------------------- 着色器 --
 const LIQUID_SKSL: &str = r#"
@@ -695,20 +699,34 @@ fn load_pos() -> Option<(i32, i32)> {
     Some((x, y))
 }
 
-fn save_pos(hwnd: HWND) {    if hwnd.is_invalid() {
-        return;
-    }
-    unsafe {
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_ok() {
-            let _ = fs::write(pos_file(), format!("{},{}", rect.left, rect.top));
+/// 把窗口位置写进记忆文件。传 `Some((x,y))` 就直接用这个位置，
+/// 传 None 就读当前窗口位置。
+fn save_pos_at(hwnd: HWND, at: Option<(i32, i32)>) {
+    let pos = match at {
+        Some(p) => Some(p),
+        None => {
+            if hwnd.is_invalid() {
+                return;
+            }
+            unsafe {
+                let mut rect = windows::Win32::Foundation::RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    Some((rect.left, rect.top))
+                } else {
+                    None
+                }
+            }
         }
+    };
+    if let Some((x, y)) = pos {
+        let _ = fs::write(pos_file(), format!("{x},{y}"));
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
-        save_pos(self.hwnd);
+        // 收在屏幕边缘时不能记那个位置，要记"家的位置"，否则下次启动就藏在边缘了
+        save_pos_at(self.hwnd, Some(self.rest_pos));
     }
 }
 
@@ -761,6 +779,19 @@ struct App {
     cap_win_pos: (i32, i32),
     /// 调试：让窗口自己每帧挪动，模拟拖动
     sim_drag: bool,
+    /// 边缘收纳：鼠标离开 5 秒后缩到最近的屏幕边，只留一条边
+    edge_enabled: bool,
+    /// 0 = 完全展开，1 = 完全收起
+    edge_anim: f32,
+    /// 鼠标离开窗口多久了（秒）
+    edge_idle: f32,
+    /// "家"的位置：展开时窗口该在哪（收起时不能拿当前位置当记忆）
+    rest_pos: (i32, i32),
+    /// 是否正在拖动（手动拖动：跟着鼠标位移走，不用系统模态拖动）
+    dragging: bool,
+    /// 按下时鼠标在哪、窗口在哪
+    drag_from_cursor: (i32, i32),
+    drag_from_window: (i32, i32),
     /// FPS 统计（debug 用）
     fps_n: u32,
     fps_t: Instant,
@@ -802,6 +833,13 @@ impl App {
             cap_origin: (0, 0),
             cap_win_pos: (i32::MIN / 2, i32::MIN / 2),
             sim_drag: false,
+            edge_enabled: true,
+            edge_anim: 0.0,
+            edge_idle: 0.0,
+            rest_pos: (0, 0),
+            dragging: false,
+            drag_from_cursor: (0, 0),
+            drag_from_window: (0, 0),
             fps_n: 0,
             fps_t: Instant::now(),
             busy_ms: 0.0,
@@ -929,6 +967,126 @@ impl App {
         dy.atan2(dx)
     }
 
+    /// 手动拖动：每帧按"鼠标总位移"重新摆窗口。
+    ///
+    /// 不用 winit 的 `drag_window()` —— 那会进系统的模态移动循环，
+    /// 期间我们的事件循环被卡住，**画面是冻结的**，窗口在动内容不动，
+    /// 看起来就是"拖动不丝滑 / 画面割裂"。手动拖动的话每一帧都能重画。
+    fn update_drag(&mut self) {
+        if !self.dragging {
+            return;
+        }
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let dx = pt.x - self.drag_from_cursor.0;
+        let dy = pt.y - self.drag_from_cursor.1;
+        let (nx, ny) = (self.drag_from_window.0 + dx, self.drag_from_window.1 + dy);
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                nx,
+                ny,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// 边缘收纳：鼠标离开 5 秒 → 滑到最近的屏幕边，只留一条 PEEK 宽的缝；
+    /// 鼠标碰到那条缝 → 滑回来。
+    ///
+    /// 返回 true 表示这一帧完全收起、可以跳过渲染（省 CPU，它是长期挂着的）。
+    fn update_edge_hide(&mut self, dt: f32) -> bool {
+        if !self.edge_enabled {
+            return false;
+        }
+        let (pt, rect) = self.cursor_and_rect();
+        let over = pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom;
+
+        // 屏幕（含多显示器的虚拟桌面范围）
+        unsafe {
+            let sx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let sy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let sw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let sh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+            // 鼠标在窗口上（收起时那条缝也算）→ 清零计时并展开
+            if over {
+                self.edge_idle = 0.0;
+            } else {
+                self.edge_idle += dt;
+            }
+            // 展开状态下把当前位置记成"家"，拖动时自动跟着更新
+            if self.edge_anim < 0.02 {
+                self.rest_pos = (rect.left, rect.top);
+            }
+
+            let target = if self.edge_idle > EDGE_HIDE_SECS && !self.dragging {
+                1.0
+            } else {
+                0.0
+            };
+            // 平滑滑动（约 0.25 秒完成）
+            self.edge_anim += (target - self.edge_anim) * (dt * 10.0).min(1.0);
+            if (target - self.edge_anim).abs() < 0.01 {
+                self.edge_anim = target;
+            }
+
+            if self.edge_anim <= 0.001 {
+                return false;
+            }
+
+            // 用"实际窗口尺寸"算，不要用渲染尺寸 W/H ——
+            // 开了高 DPI 缩放时两者不一样，用 W/H 会把窗口推到屏幕外面去。
+            let ww = rect.right - rect.left;
+            let wh = rect.bottom - rect.top;
+
+            // 选最近的那条边
+            let cx = self.rest_pos.0 + ww / 2;
+            let cy = self.rest_pos.1 + wh / 2;
+            let (dl, dr) = (cx - sx, sx + sw - cx);
+            let (dtop, dbot) = (cy - sy, sy + sh - cy);
+            let m = dl.min(dr).min(dtop).min(dbot);
+            let (hx, hy) = if m == dr {
+                (sx + sw - EDGE_PEEK, self.rest_pos.1)
+            } else if m == dl {
+                (sx - ww + EDGE_PEEK, self.rest_pos.1)
+            } else if m == dbot {
+                (self.rest_pos.0, sy + sh - EDGE_PEEK)
+            } else {
+                (self.rest_pos.0, sy - wh + EDGE_PEEK)
+            };
+
+            let a = self.edge_anim;
+            let x = (self.rest_pos.0 as f32 + (hx - self.rest_pos.0) as f32 * a).round() as i32;
+            let y = (self.rest_pos.1 as f32 + (hy - self.rest_pos.1) as f32 * a).round() as i32;
+            if (x, y) != (rect.left, rect.top) {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+            // 完全收起后只留一条缝，没必要每帧都抓屏+渲染
+            if cfg!(debug_assertions) && std::env::var_os("LG_DEBUG_EDGE").is_some() {
+                eprintln!(
+                    "[收纳] 鼠标=({},{}) 窗口=({},{}) 上={} 空闲={:.1}s 进度={:.2} 家=({},{})",
+                    pt.x, pt.y, rect.left, rect.top, over, self.edge_idle, self.edge_anim,
+                    self.rest_pos.0, self.rest_pos.1
+                );
+            }
+            self.edge_anim > 0.98
+        }
+
     /// 每帧的统计（FPS / 分段耗时）。原来的跟手小圆（液态鼓包）已按需求移除。
     fn update_stats(&mut self, _dt: f32) {
         self.fps_n += 1;
@@ -957,8 +1115,6 @@ impl App {
     }
 
     fn draw(&mut self) {
-        // 跟手小圆：按 dt 插值，帧率无关
-        // （必须放在下面的不可变借用之前，否则 self 借出冲突）
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
@@ -971,7 +1127,25 @@ impl App {
                 let _ = Beep(880, 150);
                 let _ = Beep(1180, 220);
             });
+            // 换阶段时把窗口弹出来给人看见（收起状态也先展开 5 秒）
+            self.edge_idle = 0.0;
         }
+
+        // 拖动 / 边缘收纳（都要在渲染之前摆好窗口位置）
+        self.update_drag();
+        let parked = self.update_edge_hide(dt);
+        if parked {
+            // 已经收在屏幕边上，只剩一条缝：跳过抓屏+渲染，但要保持低频轮询
+            // （番茄钟还得继续走，鼠标碰到那条缝还得能滑回来）。
+            // 不 sleep 的话这里会空转到 500+ FPS 白烧 CPU。
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            self.frame_no += 1;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            return;
+        }
+
         let t_frame = Instant::now();
 
         let (Some(_window), Some(effect), Some(dib)) = (&self.window, &self.effect, &self.dib) else {
@@ -1144,7 +1318,7 @@ impl App {
                     }
                 }
                 // process::exit 不会跑 Drop，所以这里手动存一次位置
-                save_pos(self.hwnd);
+                save_pos_at(self.hwnd, Some(self.rest_pos));
                 std::process::exit(0);
             }
         }
@@ -1239,7 +1413,23 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.draw(),
-            // 左键按下 → 拖动窗口（winit 的系统级拖动，比手动 SetWindowPos 顺滑）
+            // 左键松开 → 结束拖动，记住落点
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.dragging {
+                    self.dragging = false;
+                    let (_pt, rect) = self.cursor_and_rect();
+                    self.rest_pos = (rect.left, rect.top);
+                    // 拖到哪就记哪（下次启动回到这里）
+                    save_pos_at(self.hwnd, Some(self.rest_pos));
+                    if cfg!(debug_assertions) {
+                        eprintln!("[拖动] 结束 落点={:?}", self.rest_pos);
+                    }
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
@@ -1248,8 +1438,18 @@ impl ApplicationHandler for App {
                 MouseButton::Left => {
                     // 穿透状态下不该能拖动（鼠标事件本来就到不了窗口，这里加个保险）
                     if !self.click_through {
-                        if let Some(w) = &self.window {
-                            let _ = w.drag_window();
+                        self.dragging = true;
+                        self.edge_anim = 0.0;
+                        self.edge_idle = 0.0;
+                        let (pt, rect) = self.cursor_and_rect();
+                        self.drag_from_cursor = (pt.x, pt.y);
+                        self.drag_from_window = (rect.left, rect.top);
+                        self.rest_pos = (rect.left, rect.top);
+                        if cfg!(debug_assertions) {
+                            eprintln!(
+                                "[拖动] 开始 鼠标={:?} 窗口={:?}",
+                                self.drag_from_cursor, self.drag_from_window
+                            );
                         }
                     }
                 }
@@ -1376,6 +1576,10 @@ fn main() {
     // 调试：--glass-only 只画玻璃不画背景（PNG 的 alpha 就是玻璃轮廓）
     if args.iter().any(|a| a == "--glass-only") {
         app.glass_only = true;
+    }
+    // --no-edge-hide：关掉「鼠标离开 5 秒自动收起到屏幕边缘」
+    if args.iter().any(|a| a == "--no-edge-hide") {
+        app.edge_enabled = false;
     }
     // 调试：--sim-drag 窗口自己每帧挪一点（测拖动时的抓屏策略/帧率）
     if args.iter().any(|a| a == "--sim-drag") {
