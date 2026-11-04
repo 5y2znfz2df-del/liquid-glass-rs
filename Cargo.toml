@@ -1,13 +1,13 @@
 [package]
 name = "liquid-glass-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "Windows liquid glass rendering experiment (Skia + SkSL)"
+description = "Liquid glass Pomodoro timer for Windows (Skia + SkSL)"
 
 [dependencies]
 skia-safe = { version = "0.156.0", features = ["d3d"] }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Diagnostics_Debug"] }
 winit = "0.30.13"
 
 [build-dependencies]
