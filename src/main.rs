@@ -14,6 +14,7 @@
 // 不弹控制台窗口（否则会盖在玻璃上面）
 #![windows_subsystem = "windows"]
 
+mod installer;
 mod timer;
 
 use skia_safe::{
@@ -1652,6 +1653,20 @@ fn render_offscreen() {
 
 fn main() {
     install_panic_hook();
+
+    // 安装 / 卸载向导（同一个 exe 兼任安装程序）。
+    // 首次从安装目录外启动时自动询问，取消后按绿色版运行。
+    if installer::handle_command_line() {
+        return;
+    }
+    if installer::should_offer_first_run()
+        && matches!(
+            installer::run_wizard(true),
+            installer::WizardResult::Installed
+        )
+    {
+        return;
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--offscreen") {

@@ -7,6 +7,33 @@
 
 > 玻璃里那些被掰弯的字，是你屏幕上的真实内容，不是贴图。
 
+## 安装 / 卸载
+
+推荐直接双击发布包里的这个 exe —— 它既是番茄钟，也是安装程序：
+
+```text
+LiquidGlassPomodoro-Setup-v0.5.1.exe
+```
+
+首次运行会弹出图形安装向导：
+
+1. 欢迎页 → 选择安装位置（默认 `%LOCALAPPDATA%\Programs\LiquidGlass`）
+2. 勾选桌面快捷方式、开始菜单、开机自启
+3. 复制文件并写入卸载信息，完成后可直接运行
+
+也可以显式调用（安装后的程序名是 `LiquidGlass.exe`）：
+
+```powershell
+LiquidGlass.exe --install     # 重新打开安装向导
+LiquidGlass.exe --uninstall   # 卸载（清理快捷方式、启动项和安装目录）
+LiquidGlass.exe --portable    # 以绿色版运行，不弹向导
+```
+
+点“取消”会以绿色版继续运行，之后不再自动询问；卸载项同时会出现在 Windows 的“应用和功能”里。
+
+绿色版：下载 `liquid-glass-pomodoro-v0.5.1-win-x64.zip`，解压到任意文件夹双击
+`liquid-glass-rs.exe` 即可运行，不写注册表。
+
 ## 它是个番茄钟
 
 | 功能 | 说明 |
@@ -20,23 +47,6 @@
 | **手动拖动** | 跟着鼠标走，拖动时画面实时更新（不用系统模态拖动） |
 
 玻璃上直接显示：大号倒计时、当前阶段、第几轮、进度条、快捷键提示。
-
-## 两种安装方式
-
-| 方式 | 文件 | 说明 |
-| --- | --- | --- |
-| **安装版**（推荐） | `LiquidGlassPomodoro-Setup.exe` | 双击走安装向导，可选目录、建桌面+开始菜单快捷方式、**在「设置 → 应用」里能卸载** |
-| 绿色版 | `liquid-glass-pomodoro-v0.5.0-win-x64.zip` | 解压到任意文件夹双击运行，不写注册表 |
-
-安装版支持静默安装（给自己用/批量）：
-
-```
-LiquidGlassPomodoro-Setup.exe --silent                      自动挑一个可写目录
-LiquidGlassPomodoro-Setup.exe --silent --dir D:\Apps\LGP    装到指定目录
-```
-
-安装位置默认在 `%LOCALAPPDATA%\Programs\LiquidGlassPomodoro`（这个目录可写，
-所以 `window-pos.txt` 位置记忆能正常保存）。装完自动启动一次。
 
 ## 高 DPI（150% 缩放）
 
@@ -180,6 +190,9 @@ glass = backdrop.eval(coord + shift + backdropOffset).rgb;
 | `--offset dx,dy` | 离屏渲染时给背景采样加偏移 |
 | `--no-edge-hide` | 关掉"鼠标离开 5 秒自动收边" |
 | `--no-exclude` | 不设 `WDA_EXCLUDEFROMCAPTURE`（调试截图用） |
+| `--install` | 打开安装向导 |
+| `--uninstall` | 卸载并清理安装目录 |
+| `--portable` | 以绿色版运行，不弹安装向导 |
 
 ## 怎么自己验证（都是可量化的，不靠肉眼）
 
