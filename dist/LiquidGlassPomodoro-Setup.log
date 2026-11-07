@@ -1,0 +1,46 @@
+[2026-11-07 08:23:25]
+System.UnauthorizedAccessException: 指定的目录写不进去：C:\Users\XiangFu\AppData\Local\Temp\lgp-install-test
+   在 LiquidGlassSetup.Program.RunSilent(String requested)
+
+[2026-11-07 08:23:41]
+System.UnauthorizedAccessException: 指定的目录写不进去：C:\Users\XiangFu\AppData\Local\Temp\lgp-install-test
+   在 LiquidGlassSetup.Program.RunSilent(String requested)
+
+[2026-11-07 08:23:42]
+以下目录不可写，已跳过：
+  ✗ C:\Users\XiangFu\AppData\Local\Programs\LiquidGlassPomodoro
+  ✗ C:\Users\XiangFu\AppData\Local\LiquidGlassPomodoro
+  ✗ C:\Users\XiangFu\AppData\Roaming\LiquidGlassPomodoro
+  ✗ C:\Users\XiangFu\LiquidGlassPomodoro
+
+
+[2026-11-07 08:23:42]
+[  3%] 正在安装到 C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\liquid-glass-rs\dist\LiquidGlassApp
+
+[2026-11-07 08:23:42]
+[  5%] 检测到旧版本，正在移除…
+
+[2026-11-07 08:23:43]
+[ 94%] 正在解压… 5/5
+
+[2026-11-07 08:23:43]
+[ 94%] 正在检查运行时文件…
+
+[2026-11-07 08:23:43]
+当前系统是 Windows 6.2，亚克力模糊不可用，界面会退回不透明样式。
+
+[2026-11-07 08:23:43]
+[ 96%] 正在创建快捷方式…
+
+[2026-11-07 08:23:43]
+创建快捷方式失败（不影响程序本身）：调用的目标发生了异常。
+
+[2026-11-07 08:23:43]
+[ 96%] 快捷方式创建失败，但程序已安装
+
+[2026-11-07 08:23:43]
+[100%] 安装完成，正在启动…
+
+[2026-11-07 08:23:49]
+安装完成：C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\liquid-glass-rs\dist\LiquidGlassApp\LiquidGlassPomodoro.exe
+

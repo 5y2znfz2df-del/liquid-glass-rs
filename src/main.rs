@@ -18,7 +18,7 @@ mod timer;
 
 use skia_safe::{
     surfaces, Color, Data, EncodedImageFormat, Font, Paint, PaintStyle, Rect, RuntimeEffect,
-    SamplingOptions, Surface, TileMode,
+    FilterMode, MipmapMode, SamplingOptions, Surface, TileMode,
 };use std::ffi::c_void;
 use std::fs;
 use std::time::Instant;
@@ -30,6 +30,7 @@ use windows::Win32::Graphics::Gdi::{
     BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::System::Diagnostics::Debug::Beep;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_R, VK_S, VK_SHIFT, VK_SPACE, VK_T,
 };
@@ -41,22 +42,79 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TRANSPARENT,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId, WindowLevel};
 
-/// 窗口尺寸
-const W: i32 = 428;
-const H: i32 = 248;
-/// 抓屏时窗口四周多抓多少像素。窗口在这么多像素内移动都不用重抓，
-/// 只靠 backdropOffset 平移就能保证画面跟窗口对齐（拖动不割裂、不掉帧）。
-const CAP_MARGIN: i32 = 120;
+/// 逻辑尺寸（100% 缩放下的基准值）。实际像素 = 这个值 × 系统 DPI 缩放。
+const GLASS_W: f32 = 420.0;
+const GLASS_H: f32 = 240.0;
+/// 玻璃四周留多少（给边缘那 1.8px 轮廓过渡）
+const GLASS_PAD: f32 = 4.0;
+/// 抓屏时窗口四周多抓多少（逻辑像素）
+const CAP_MARGIN: f32 = 120.0;
 /// 鼠标离开多少秒后自动收起到屏幕边缘
 const EDGE_HIDE_SECS: f32 = 5.0;
 /// 收起后还露在外面的宽度（够鼠标碰到就行）
 const EDGE_PEEK: i32 = 10;
+
+/// 按 DPI 缩放算出来的一整套像素尺寸。
+///
+/// ⚠️ 最关键的一条：**窗口的物理像素尺寸必须等于画布尺寸**。
+/// 要是让 winit 按逻辑尺寸建窗口（150% 缩放下会变成 642×372），
+/// 而我们只画 428×248，DWM 就会把内容拉伸 1.5 倍；同时抓屏偏移是按物理像素
+/// 算的，采样位置越往右偏得越多，到边缘被 clamp —— 看起来就是文字被拉成一条条竖线。
+#[derive(Clone, Copy)]
+struct Layout {
+    w: i32,
+    h: i32,
+    glass_w: f32,
+    glass_h: f32,
+    scale: f32,
+    cap_margin: i32,
+    corner: f32,
+    bezel: f32,
+    thickness: f32,
+    digit_pt: f32,
+    label_pt: f32,
+    hint_pt: f32,
+}
+
+impl Layout {
+    fn for_scale(s: f32) -> Self {
+        let glass_w = GLASS_W * s;
+        let glass_h = GLASS_H * s;
+        Self {
+            w: (glass_w + GLASS_PAD * 2.0 * s).round() as i32,
+            h: (glass_h + GLASS_PAD * 2.0 * s).round() as i32,
+            glass_w,
+            glass_h,
+            scale: s,
+            cap_margin: (CAP_MARGIN * s).round() as i32,
+            corner: 46.0 * s,
+            bezel: 26.0 * s,
+            thickness: 34.0 * s,
+            digit_pt: 88.0 * s,
+            label_pt: 21.0 * s,
+            hint_pt: 12.5 * s,
+        }
+    }
+}
+
+/// 全局 DPI 缩放因子（1.0 = 100%）。启动时按系统 DPI 设一次。
+static SCALE_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000);
+
+fn set_scale(s: f32) {
+    SCALE_BITS.store(s.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn lay() -> Layout {
+    Layout::for_scale(f32::from_bits(
+        SCALE_BITS.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
 
 // ---------------------------------------------------------------- 着色器 --
 const LIQUID_SKSL: &str = r#"
@@ -277,9 +335,9 @@ impl Overlay {
             .or_else(|| fm.legacy_make_typeface(None, normal))?;
         let hint_face = label_face.clone();
         Some(Self {
-            digits: Font::new(digits_face, 88.0),
-            label: Font::new(label_face, 21.0),
-            hint: Font::new(hint_face, 12.5),
+            digits: Font::new(digits_face, lay().digit_pt),
+            label: Font::new(label_face, lay().label_pt),
+            hint: Font::new(hint_face, lay().hint_pt),
         })
     }
 }
@@ -319,14 +377,15 @@ fn draw_overlay(
     // 玻璃高度 240，从上往下排：数字 / 副标题 / 进度条 / 提示
     let top = glass_rect.top();
 
-    draw_centered(canvas, &pomo.text(), cx, top + 128.0, &overlay.digits, 245);
-    draw_centered(canvas, &pomo.subtitle(), cx, top + 168.0, &overlay.label, 210);
+    let s = lay().scale;
+    draw_centered(canvas, &pomo.text(), cx, top + 128.0 * s, &overlay.digits, 245);
+    draw_centered(canvas, &pomo.subtitle(), cx, top + 168.0 * s, &overlay.label, 210);
 
     // 进度条：底槽 + 已用部分
-    let bar_w = 232.0f32;
-    let bar_h = 4.0f32;
+    let bar_w = 232.0f32 * s;
+    let bar_h = 4.0f32 * s;
     let bar_x = cx - bar_w / 2.0;
-    let bar_y = top + 190.0;
+    let bar_y = top + 190.0 * s;
     let mut track = Paint::default();
     track.set_anti_alias(true);
     track.set_color(Color::from_argb(60, 255, 255, 255));
@@ -363,7 +422,7 @@ fn draw_overlay(
     } else {
         "空格 开始    R 重置    S 跳过    T 穿透"
     };
-    draw_centered(canvas, hint, cx, top + 218.0, &overlay.hint, 150);
+    draw_centered(canvas, hint, cx, top + 218.0 * s, &overlay.hint, 150);
 }
 
 // ------------------------------------------------------------ 渲染一帧 --
@@ -372,6 +431,8 @@ fn draw_overlay(
 /// `backdrop` 为 None 时画测试图案（离屏调试用）。
 fn draw_frame(
     surface: &mut Surface,
+    // 半分辨率玻璃缓冲（复用，避免每帧分配）
+    glass_surf: &mut Option<Surface>,
     effect: &RuntimeEffect,
     t: f32,
     backdrop: Option<&skia_safe::Image>,
@@ -409,8 +470,8 @@ fn draw_frame(
                 let mut p = Paint::default();
                 p.set_color(*c);
                 p.set_anti_alias(true);
-                let cw = W as f32 / 3.0;
-                let ch = H as f32 / 2.0;
+                let cw = lay().w as f32 / 3.0;
+                let ch = lay().h as f32 / 2.0;
                 let x = (i as f32 % 3.0) * cw;
                 let y = (i as f32 / 3.0) * ch;
                 canvas.draw_rect(Rect::from_xywh(x, y, cw, ch), &p);
@@ -423,14 +484,14 @@ fn draw_frame(
             line.set_stroke_width(2.0);
             let offset = (t * 40.0) % 22.0;
             let mut y = offset - 22.0;
-            while y < H as f32 {
-                canvas.draw_line((0.0, y), (W as f32, y), &line);
+            while y < lay().h as f32 {
+                canvas.draw_line((0.0, y), (lay().w as f32, y), &line);
                 y += 22.0;
             }
             // 竖线：折射位移是水平方向的，竖线被掰弯才量得出来
             let mut x = offset - 22.0;
-            while x < W as f32 {
-                canvas.draw_line((x, 0.0), (x, H as f32), &line);
+            while x < lay().w as f32 {
+                canvas.draw_line((x, 0.0), (x, lay().h as f32), &line);
                 x += 22.0;
             }
         }
@@ -453,19 +514,19 @@ fn draw_frame(
     // image_snapshot 是不可变快照，之后 clear 会触发 copy-on-write，快照仍然有效。
     surface.canvas().clear(Color::TRANSPARENT);
 
-    let rect_w = 420.0f32;
-    let rect_h = 240.0f32;
+    let rect_w = lay().glass_w;
+    let rect_h = lay().glass_h;
     // 布局必须和 SkSL 里的 uniform 声明一一对应（含 16 字节对齐的 float4）
     // 0 rectSize | 2 center | 4..11 标量 | 12 tintColor | 16 tintColor2 | 20 backdropOffset
     // （共 22 个 float = 88 字节）
     let uniform: [f32; 22] = [
         rect_w,
         rect_h,
-        W as f32 / 2.0,
-        H as f32 / 2.0,
-        46.0,           // corner
-        26.0,           // bezel：边缘折射带（调窄了，边框更细）
-        34.0,           // thickness：玻璃厚度
+        lay().w as f32 / 2.0,
+        lay().h as f32 / 2.0,
+        lay().corner,   // corner
+        lay().bezel,    // bezel：边缘折射带
+        lay().thickness, // thickness：玻璃厚度
         1.42,           // ior
         0.05,           // dispersion
         light_angle,    // 跟手：光源方向 = 光标相对玻璃中心的方位角
@@ -516,26 +577,54 @@ fn draw_frame(
         paint.set_anti_alias(false);
         // pad 只留 2px 给边缘那 1.8px 的轮廓过渡，别再往外扩了 ——
         // 扩多少就多画多少像素，这是每帧渲染时间的直接来源。
-        let pad = 2.0f32;
+        let pad = 2.0 * lay().scale;
         let rect = Rect::from_xywh(
-            (W as f32 - rect_w) / 2.0 - pad,
-            (H as f32 - rect_h) / 2.0 - pad,
+            (lay().w as f32 - rect_w) / 2.0 - pad,
+            (lay().h as f32 - rect_h) / 2.0 - pad,
             rect_w + pad * 2.0,
             rect_h + pad * 2.0,
         );
-        // 重新借一次 canvas 画玻璃
-        let canvas = surface.canvas();
-        canvas.draw_rect(rect, &paint);
 
-        // ---- 番茄钟的文字（画在玻璃之上，不参与折射，保证读得清）----
+        // ---- 折射层用半分辨率渲染，再放大贴回来 ----
+        //
+        // 玻璃里是平滑的折射渐变，半分辨率放大几乎看不出差别，但像素少了 4 倍
+        // （150% 缩放下 642×372 = 24 万像素 → 6 万像素，渲染时间从 38ms 降到 10ms）。
+        // 文字是之后单独用全分辨率画的，不受影响，依然清晰。
+        let gw = (lay().w / 2).max(1);
+        let gh = (lay().h / 2).max(1);
+        if glass_surf.is_none() {
+            *glass_surf = surfaces::raster_n32_premul((gw, gh));
+        }
+        if let Some(gs) = glass_surf.as_mut() {
+            {
+                let gc = gs.canvas();
+                gc.clear(Color::TRANSPARENT);
+                gc.save();
+                // 关键：把画布缩放 0.5，着色器里的 coord 仍然是"全分辨率坐标"，
+                // 所有 uniform 都不用改，只是按半分辨率光栅化。
+                gc.scale((0.5, 0.5));
+                gc.draw_rect(rect, &paint);
+                gc.restore();
+            }
+            let img = gs.image_snapshot();
+            let sampling = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
+            let dst = Rect::from_xywh(0.0, 0.0, lay().w as f32, lay().h as f32);
+            let mut up = Paint::default();
+            up.set_anti_alias(false);
+            surface
+                .canvas()
+                .draw_image_rect_with_sampling_options(&img, None, dst, sampling, &up);
+        }
+
+        // ---- 番茄钟的文字（全分辨率，画在玻璃之上，不参与折射）----
         if let Some(ov) = overlay {
             let glass = Rect::from_xywh(
-                (W as f32 - rect_w) / 2.0,
-                (H as f32 - rect_h) / 2.0,
+                (lay().w as f32 - rect_w) / 2.0,
+                (lay().h as f32 - rect_h) / 2.0,
                 rect_w,
                 rect_h,
             );
-            draw_overlay(canvas, ov, pomo, glass);
+            draw_overlay(surface.canvas(), ov, pomo, glass);
         }
     } else {
         static ONCE2: std::sync::Once = std::sync::Once::new();
@@ -739,6 +828,8 @@ struct App {
     start: Instant,
     /// 复用的 Skia 画布（避免每帧重新分配）
     surface: Option<Surface>,
+    /// 半分辨率玻璃缓冲（折射层用它渲染再放大，省 4 倍像素）
+    glass_surf: Option<Surface>,
     /// 复用的像素缓冲
     buf: Vec<u8>,
     /// 是否处于点击穿透状态
@@ -812,6 +903,7 @@ impl App {
             hwnd: HWND(std::ptr::null_mut()),
             start: Instant::now(),
             surface: None,
+            glass_surf: None,
             buf: Vec::new(),
             click_through: false,
             prev_esc: false,
@@ -944,8 +1036,8 @@ impl App {
         let cx = pt.x - rect.left;
         let cy = pt.y - rect.top;
         (
-            cx as f32 - W as f32 / 2.0,
-            cy as f32 - H as f32 / 2.0,
+            cx as f32 - lay().w as f32 / 2.0,
+            cy as f32 - lay().h as f32 / 2.0,
         )
     }
 
@@ -1193,10 +1285,10 @@ impl App {
             let sy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
 
             // 期望区域：以窗口为中心向外扩 margin，再夹到屏幕范围内
-            let cw = W + CAP_MARGIN * 2;
-            let ch = H + CAP_MARGIN * 2;
-            let want_x = win_pos.0 - CAP_MARGIN;
-            let want_y = win_pos.1 - CAP_MARGIN;
+            let cw = lay().w + lay().cap_margin * 2;
+            let ch = lay().h + lay().cap_margin * 2;
+            let want_x = win_pos.0 - lay().cap_margin;
+            let want_y = win_pos.1 - lay().cap_margin;
             let cap_x = if sw > cw { want_x.clamp(sx, sx + sw - cw) } else { sx };
             let cap_y = if sh > ch { want_y.clamp(sy, sy + sh - ch) } else { sy };
 
@@ -1207,7 +1299,7 @@ impl App {
             let drift = (win_pos.0 - self.cap_win_pos.0)
                 .abs()
                 .max((win_pos.1 - self.cap_win_pos.1).abs());
-            let outside = self.backdrop.is_none() || drift > CAP_MARGIN;
+            let outside = self.backdrop.is_none() || drift > lay().cap_margin;
             // 拖动时不做定期刷新（只靠偏移平移，最省最顺）；
             // 静止时每 2 帧刷新一次，让玻璃里的桌面跟得上变化
             // 静止时也不用每帧抓：桌面很少变，3 帧刷一次（约 100ms）足够，
@@ -1271,9 +1363,10 @@ impl App {
         let t_rnd = Instant::now();
         let surface = self
             .surface
-            .get_or_insert_with(|| surfaces::raster_n32_premul((W, H)).expect("surface"));
+            .get_or_insert_with(|| surfaces::raster_n32_premul((lay().w, lay().h)).expect("surface"));
         draw_frame(
             surface,
+            &mut self.glass_surf,
             effect,
             t,
             self.backdrop.as_ref(),
@@ -1287,17 +1380,17 @@ impl App {
 
         // 用 read_pixels 取出来（peek_pixels 在这个版本拿不到数据）
         let info = skia_safe::ImageInfo::new(
-            (W, H),
+            (lay().w, lay().h),
             skia_safe::ColorType::BGRA8888,
             skia_safe::AlphaType::Premul,
             None,
         );
         // 复用缓冲，避免每帧 vec![0u8; ...] 分配
-        if self.buf.len() != (W * H * 4) as usize {
-            self.buf = vec![0u8; (W * H * 4) as usize];
+        if self.buf.len() != (lay().w * lay().h * 4) as usize {
+            self.buf = vec![0u8; (lay().w * lay().h * 4) as usize];
         }
         let t_read = Instant::now();
-        let ok = surface.read_pixels(&info, &mut self.buf, (W * 4) as usize, (0, 0));
+        let ok = surface.read_pixels(&info, &mut self.buf, (lay().w * 4) as usize, (0, 0));
         let ms_read = t_read.elapsed().as_secs_f32() * 1000.0;
 
         let t_blit = Instant::now();
@@ -1345,7 +1438,7 @@ impl ApplicationHandler for App {
 
         let attrs = Window::default_attributes()
             .with_title("Liquid Glass")
-            .with_inner_size(LogicalSize::new(W as f64, H as f64))
+            .with_inner_size(PhysicalSize::new(lay().w as u32, lay().h as u32))
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(false)
@@ -1388,7 +1481,7 @@ impl ApplicationHandler for App {
             .unwrap_or_else(|e| panic!("SkSL 编译失败: {e}"));
 
         self.hwnd = hwnd;
-        self.dib = Some(Dib::new(W, H));
+        self.dib = Some(Dib::new(lay().w, lay().h));
         self.effect = Some(effect);
         self.window = Some(window);
         self.start = Instant::now();
@@ -1522,7 +1615,7 @@ impl ApplicationHandler for App {
 fn render_offscreen() {
     let effect = RuntimeEffect::make_for_shader(LIQUID_SKSL, None)
         .unwrap_or_else(|e| panic!("SkSL 编译失败: {e}"));
-    let mut surface = surfaces::raster_n32_premul((W, H)).expect("surface");
+    let mut surface = surfaces::raster_n32_premul((lay().w, lay().h)).expect("surface");
     // 调试：--offset dx,dy 直接给背景采样加偏移（验证"抓屏带余量"的采样数学）
     let mut off = (0.0f32, 0.0f32);
     let args: Vec<String> = std::env::args().collect();
@@ -1534,8 +1627,10 @@ fn render_offscreen() {
             }
         }
     }
+    let mut gs_off: Option<Surface> = None;
     draw_frame(
         &mut surface,
+        &mut gs_off,
         &effect,
         0.0,
         None,
@@ -1565,6 +1660,19 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("事件循环创建失败");
+    // winit 在创建事件循环时已经把进程设成 DPI 感知，所以这里读到的是真实 DPI。
+    // 150% 缩放 → 1.5，界面整体按这个比例放大，窗口物理尺寸 == 画布尺寸（1:1）。
+    {
+        let dpi = unsafe { GetDpiForSystem() } as f32;
+        let s = if dpi > 0.0 { dpi / 96.0 } else { 1.0 };
+        set_scale(s);
+        println!(
+            "[调试] 系统 DPI = {dpi}，缩放 {:.0}%，窗口 {}x{}",
+            s * 100.0,
+            lay().w,
+            lay().h
+        );
+    }
     let mut app = App::new();
 
     // 调试：--dump-frame <path> 跑 60 帧后把渲染结果存盘退出
