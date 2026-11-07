@@ -44,3 +44,97 @@ System.UnauthorizedAccessException: 指定的目录写不进去：C:\Users\Xiang
 [2026-11-07 08:23:49]
 安装完成：C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\liquid-glass-rs\dist\LiquidGlassApp\LiquidGlassPomodoro.exe
 
+[2026-11-07 08:35:34]
+System.UnauthorizedAccessException: 指定的目录写不进去：C:\Users\XiangFu\Downloads\LGP-Test
+   在 LiquidGlassSetup.Program.RunSilent(String requested)
+
+[2026-11-07 08:35:57]
+[  3%] 正在安装到 C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\.tmp\lgp-test2
+
+[2026-11-07 08:35:57]
+[  5%] 检测到旧版本，正在移除…
+
+[2026-11-07 08:35:57]
+[ 94%] 正在解压… 5/5
+
+[2026-11-07 08:35:57]
+[ 94%] 正在检查运行时文件…
+
+[2026-11-07 08:35:57]
+当前系统是 Windows 6.2，亚克力模糊不可用，界面会退回不透明样式。
+
+[2026-11-07 08:35:57]
+[ 96%] 正在创建快捷方式…
+
+[2026-11-07 08:35:57]
+创建快捷方式失败（不影响程序本身）：调用的目标发生了异常。
+
+[2026-11-07 08:35:57]
+[ 96%] 快捷方式创建失败，但程序已安装
+
+[2026-11-07 08:35:57]
+[100%] 安装完成，正在启动…
+
+[2026-11-07 08:36:01]
+安装完成：C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\.tmp\lgp-test2\LiquidGlassPomodoro.exe
+
+[2026-11-07 08:41:15]
+[  3%] 正在安装到 C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\.tmp\lgp-test3
+
+[2026-11-07 08:41:16]
+[  5%] 检测到旧版本，正在移除…
+
+[2026-11-07 08:41:16]
+[ 94%] 正在解压… 5/5
+
+[2026-11-07 08:41:16]
+[ 94%] 正在检查运行时文件…
+
+[2026-11-07 08:41:16]
+当前系统是 Windows 6.2，亚克力模糊不可用，界面会退回不透明样式。
+
+[2026-11-07 08:41:16]
+[ 96%] 正在创建快捷方式…
+
+[2026-11-07 08:41:16]
+创建快捷方式失败（不影响程序本身）：调用的目标发生了异常。
+
+[2026-11-07 08:41:16]
+[ 96%] 快捷方式创建失败，但程序已安装
+
+[2026-11-07 08:41:16]
+写卸载注册表项失败（不影响使用）：对注册表项“HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\LiquidGlassPomodoro”的访问被拒绝。
+
+[2026-11-07 08:41:16]
+[100%] 安装完成，正在启动…
+
+[2026-11-07 08:51:46]
+[  3%] 正在安装到 C:\Users\XiangFu\Documents\deepseek-harness\default-workspace\.tmp\verify
+
+[2026-11-07 08:51:46]
+[  5%] 检测到旧版本，正在移除…
+
+[2026-11-07 08:51:46]
+[ 94%] 正在解压… 5/5
+
+[2026-11-07 08:51:46]
+[ 94%] 正在检查运行时文件…
+
+[2026-11-07 08:51:46]
+当前系统是 Windows 6.2，亚克力模糊不可用，界面会退回不透明样式。
+
+[2026-11-07 08:51:46]
+[ 96%] 正在创建快捷方式…
+
+[2026-11-07 08:51:46]
+创建快捷方式失败（不影响程序本身）：调用的目标发生了异常。
+
+[2026-11-07 08:51:46]
+[ 96%] 快捷方式创建失败，但程序已安装
+
+[2026-11-07 08:51:46]
+写卸载注册表项失败（不影响使用）：对注册表项“HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\LiquidGlassPomodoro”的访问被拒绝。
+
+[2026-11-07 08:51:46]
+[100%] 安装完成，正在启动…
+

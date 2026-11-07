@@ -30,9 +30,9 @@ using System.Windows.Forms;
 [assembly: AssemblyCopyright("GPL-3.0-or-later © 2026 XiangFu")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
-[assembly: AssemblyVersion("0.4.0.0")]
-[assembly: AssemblyFileVersion("0.4.0.0")]
-[assembly: AssemblyInformationalVersion("0.4.0")]
+[assembly: AssemblyVersion("0.5.0.0")]
+[assembly: AssemblyFileVersion("0.5.0.0")]
+[assembly: AssemblyInformationalVersion("0.5.0")]
 
 namespace LiquidGlassSetup
 {
@@ -44,7 +44,7 @@ namespace LiquidGlassSetup
 
         private const string AppName = "液态玻璃番茄钟";
         private const string AppKey = "LiquidGlassPomodoro";
-        private const string AppVersion = "0.4.0";
+        private const string AppVersion = "0.5.0";
         private const string ResourceName = "payload.zip";
 
         private static string _destDir = "";
@@ -364,8 +364,9 @@ namespace LiquidGlassSetup
                 File.Delete(probe);
                 return true;
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Console.Error.WriteLine("[诊断] CanWrite(" + dir + ") 失败: " + ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
         }
@@ -393,17 +394,26 @@ namespace LiquidGlassSetup
             VerifyInstall();
 
             report("正在创建快捷方式…", 96);
+            // 三件事分开做：任何一件失败都不能连带后面的（比如桌面写不了，
+            // 但注册表卸载项和卸载脚本必须照样写上，否则用户没法卸载）
             try
             {
                 CreateShortcuts();
-                WriteUninstaller();
-                WriteUninstallRegistry();
             }
             catch (Exception ex)
             {
                 TryLog("创建快捷方式失败（不影响程序本身）：" + ex.Message);
                 report("快捷方式创建失败，但程序已安装", 96);
             }
+            try
+            {
+                WriteUninstaller();
+            }
+            catch (Exception ex)
+            {
+                TryLog("写卸载脚本失败：" + ex.Message);
+            }
+            WriteUninstallRegistry();
 
             report("安装完成，正在启动…", 100);
             Thread.Sleep(300);

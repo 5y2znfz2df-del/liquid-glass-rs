@@ -3,3 +3,7 @@
 # 运行时产物
 window-pos.txt
 liquid-glass-error.log
+
+# 安装包构建中间产物
+installer/staging/
+dist/
